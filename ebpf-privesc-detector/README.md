@@ -1,6 +1,11 @@
-# eBPF & Machine Learning Linux Privilege Escalation Detector (Project 3)
+# eBPF & Machine Learning Linux Privilege Escalation Detector
+
+[![GitHub Repository](https://img.shields.io/badge/GitHub-Yusei1708%2Febpf--privesc--detector-blue?logo=github)](https://github.com/Yusei1708/ebpf-privesc-detector)
+[![Kernel LTS](https://img.shields.io/badge/Linux-6.x%20LTS-orange?logo=linux)](https://kernel.org)
+[![Python](https://img.shields.io/badge/Python-3.14-green?logo=python)](https://python.org)
 
 Hệ thống giám sát và phát hiện tấn công leo thang đặc quyền (Privilege Escalation) theo thời gian thực trên Linux Kernel sử dụng công nghệ **eBPF (Extended Berkeley Packet Filter)** kết hợp mô hình học máy **Machine Learning (Isolation Forest & Random Forest)**.
+Repository: [https://github.com/Yusei1708/ebpf-privesc-detector](https://github.com/Yusei1708/ebpf-privesc-detector)
 
 ---
 
