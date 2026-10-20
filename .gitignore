@@ -1,0 +1,24 @@
+# Environments
+.venv/
+*/.venv/
+venv/
+*/venv/
+env/
+
+# Python cache
+__pycache__/
+*/__pycache__/
+*/*/__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs & temp
+*.log
+/tmp/
