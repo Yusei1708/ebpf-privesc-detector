@@ -1,5 +1,4 @@
 {
-  "n_samples": 12000,
   "features": [
     "exec_count",
     "uid_change_flag",
@@ -10,15 +9,5 @@
     "cap_check_count",
     "priv_syscall_rate"
   ],
-  "rf_auc": 1.0,
-  "feature_importances": {
-    "exec_count": 0.01902285694420051,
-    "uid_change_flag": 0.08067303591792567,
-    "is_whitelisted_bin": 0.4020819648265119,
-    "suspicious_path_flag": 0.03863419888634177,
-    "service_parent_flag": 0.004263926095898553,
-    "sensitive_file_access": 0.12326869217632273,
-    "cap_check_count": 0.051985767494315695,
-    "priv_syscall_rate": 0.2800695576584832
-  }
+  "samples": 15000
 }
