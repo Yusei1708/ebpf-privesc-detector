@@ -1,10 +1,13 @@
 """
 agent/features.py: Trích xuất đặc trưng hành vi tiến trình từ sự kiện eBPF
-Sử dụng kỹ thuật Sliding Window (3 giây), Process Lineage, xử lý PID reuse và gom hành vi cha-con.
+Sử dụng kỹ thuật Sliding Window (3 giây) theo timestamp của sự kiện,
+Process Lineage, xử lý an toàn PID reuse và ranh giới thư mục chính xác.
 """
 
 import time
+import bisect
 from collections import deque, defaultdict
+from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple, Set
 import numpy as np
 
@@ -24,13 +27,12 @@ WHITELISTED_SUID_BINS: Set[str] = {
     "ping",
 }
 
-# Các đường dẫn thực thi đáng ngờ (nơi attacker hay drop payload/script)
-SUSPICIOUS_PATH_PREFIXES = (
+# Các thư mục thực thi đáng ngờ (ranh giới thư mục chuẩn xác)
+SUSPICIOUS_DIRECTORIES = (
     "/tmp",
     "/var/tmp",
     "/dev/shm",
     "/run/user",
-    "/memfd:",
 )
 
 # Danh sách daemon/dịch vụ mạng hoặc interpreter thường bị khai thác (Web Shell, RCE)
@@ -70,9 +72,69 @@ FEATURE_NAMES: List[str] = [
 ]
 
 
+def is_suspicious_path(path: str) -> bool:
+    """
+    Kiểm tra xem đường dẫn có nằm trong thư mục tạm/nguy hiểm hay không.
+    So sánh chính xác theo ranh giới thư mục để tránh so khớp sai (ví dụ: /tmpfoo không thuộc /tmp).
+    """
+    if not path or not isinstance(path, str):
+        return False
+    clean = path.strip()
+    for base in SUSPICIOUS_DIRECTORIES:
+        if clean == base or clean.startswith(base + "/"):
+            return True
+    if clean.startswith("/memfd:"):
+        return True
+    return False
+
+
+def get_event_timestamp(event: Dict[str, Any], fallback_time: Optional[float] = None) -> float:
+    """
+    Trích xuất timestamp thực tế của sự kiện theo đơn vị giây (float).
+    Ưu tiên:
+      1. timestamp_ns (nanoseconds từ kernel bpf_ktime_get_ns())
+      2. timestamp_iso (chuẩn ISO-8601 UTC)
+      3. timestamp (số giây UNIX epoch)
+      4. fallback_time hoặc time.time() nếu dữ liệu thiếu
+    """
+    if not event or not isinstance(event, dict):
+        return fallback_time if fallback_time is not None else time.time()
+
+    # 1. timestamp_ns từ nhân Linux
+    ts_ns = event.get("timestamp_ns")
+    if ts_ns is not None:
+        try:
+            val_ns = float(ts_ns)
+            if val_ns > 0:
+                return val_ns / 1e9
+        except (ValueError, TypeError):
+            pass
+
+    # 2. timestamp (epoch seconds)
+    ts_sec = event.get("timestamp")
+    if ts_sec is not None:
+        try:
+            val_sec = float(ts_sec)
+            if val_sec > 0:
+                return val_sec
+        except (ValueError, TypeError):
+            pass
+
+    # 3. timestamp_iso
+    ts_iso = event.get("timestamp_iso")
+    if ts_iso and isinstance(ts_iso, str):
+        try:
+            dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+            return dt.timestamp()
+        except Exception:
+            pass
+
+    return fallback_time if fallback_time is not None else time.time()
+
+
 class ProcessNode:
     """Đại diện cho một node trong cây phả hệ tiến trình (Process Lineage)"""
-    def __init__(self, pid: int, ppid: int, comm: str, uid: int, euid: int, cgroup_id: int, mntns_id: int):
+    def __init__(self, pid: int, ppid: int, comm: str, uid: int, euid: int, cgroup_id: int, mntns_id: int, start_time: float):
         self.pid = pid
         self.ppid = ppid
         self.comm = comm
@@ -81,88 +143,110 @@ class ProcessNode:
         self.cgroup_id = cgroup_id
         self.mntns_id = mntns_id
         self.exe_paths: List[str] = []
-        self.start_time = time.time()
-        self.last_seen = time.time()
+        self.start_time = start_time
+        self.last_seen = start_time
 
 
 class FeatureExtractor:
     """
-    Quản lý bộ đệm sự kiện theo cửa sổ trượt (Sliding Window 3.0s),
-    hỗ trợ PID Reuse Detection, Process Lineage Aggregation
-    và trích xuất vector 8 đặc trưng nhất quán.
+    Quản lý bộ đệm sự kiện theo cửa sổ trượt (Sliding Window 3.0s) dựa trên
+    timestamp thực tế của sự kiện.
+    Hỗ trợ cả trực tiếp (live eBPF) lẫn phát lại ngoại tuyến (offline telemetry replay).
     """
     def __init__(self, window_size_seconds: float = 3.0):
-        self.window_size = window_size_seconds
-        # Lưu sự kiện theo tgid: tgid -> deque[(timestamp_float, event_dict)]
-        self.event_windows: Dict[int, deque] = defaultdict(deque)
+        self.window_size = float(window_size_seconds)
+        # Lưu sự kiện theo tgid: tgid -> list[(event_timestamp_float, event_dict)] (luôn duy trì sắp xếp)
+        self.event_windows: Dict[int, List[Tuple[float, Dict[str, Any]]]] = defaultdict(list)
         # Bảng theo dõi cây phả hệ tiến trình: pid -> ProcessNode
         self.process_tree: Dict[int, ProcessNode] = {}
-        # Theo dõi UID ban đầu khi tiến trình bắt đầu hoạt động
+        # Theo dõi UID ban đầu khi tiến trình bắt đầu xuất hiện
         self.initial_uids: Dict[int, int] = {}
-        # Theo dõi thời điểm xuất hiện lần đầu của tiến trình
-        self.process_start_times: Dict[int, float] = {}
 
-    def update_process(self, pid: int, ppid: int, comm: str, uid: int, euid: int, cgroup_id: int, mntns_id: int):
-        now = time.time()
+    def update_process(self, pid: int, ppid: int, comm: str, uid: int, euid: int, cgroup_id: int, mntns_id: int, event_time: Optional[float] = None):
+        """
+        Cập nhật trạng thái tiến trình một cách an toàn.
+        Lưu ý kỹ thuật về Vòng đời & Tái sử dụng PID (PID Reuse):
+        - Không xóa trạng thái chỉ vì tiến trình tạm dừng (idle).
+        - Không coi việc thay đổi PPID đơn thuần là PID reuse, vì trong Linux khi tiến trình cha chết,
+          tiến trình con sẽ tự động được gán lại (reparent) sang init (PID 1) hoặc systemd/subreaper.
+        - Giữ nguyên trạng thái để không làm mất bằng chứng chuỗi tấn công (lineage).
+        """
+        ts = event_time if event_time is not None else time.time()
 
-        # Kiểm tra hiện tượng tái sử dụng PID (PID Recycling/Reuse)
-        # Nếu PID đã tồn tại nhưng có khoảng trống thời gian lớn (> window_size * 2) hoặc PPID thay đổi đột ngột
         if pid in self.process_tree:
             node = self.process_tree[pid]
-            time_gap = now - node.last_seen
-            if time_gap > (self.window_size * 2) or (ppid != node.ppid and ppid != 0 and node.ppid != 0):
-                # Phát hiện PID reuse: Reset context để không ô nhiễm tiến trình mới
-                self.event_windows[pid].clear()
-                self.initial_uids[pid] = uid
-                self.process_start_times[pid] = now
-                self.process_tree[pid] = ProcessNode(pid, ppid, comm, uid, euid, cgroup_id, mntns_id)
-                return
-
+            # Cập nhật thông tin và ghi nhận thời gian thấy mới nhất
             node.ppid = ppid
             node.comm = comm
             node.uid = uid
             node.euid = euid
-            node.last_seen = now
+            node.last_seen = max(node.last_seen, ts)
         else:
-            self.process_tree[pid] = ProcessNode(pid, ppid, comm, uid, euid, cgroup_id, mntns_id)
+            self.process_tree[pid] = ProcessNode(pid, ppid, comm, uid, euid, cgroup_id, mntns_id, start_time=ts)
             self.initial_uids[pid] = uid
-            self.process_start_times[pid] = now
 
     def add_event(self, event: Dict[str, Any]):
-        """Thêm sự kiện mới vào sliding window của tiến trình"""
+        """
+        Thêm sự kiện mới vào sliding window của tiến trình dựa trên timestamp của sự kiện.
+        Tự động xử lý sự kiện đến muộn hoặc xáo trộn thứ tự thời gian.
+        """
         tgid = event.get("tgid", 0)
-        now = time.time()
+        ev_ts = get_event_timestamp(event)
 
-        # Nếu sự kiện là execve mới cho một tiến trình đã idle lâu, reset window
-        if event.get("event_type") == 1 and tgid in self.process_tree:  # EVENT_EXECVE
-            node = self.process_tree[tgid]
-            if (now - node.last_seen) > self.window_size:
-                self.event_windows[tgid].clear()
-                self.initial_uids[tgid] = event.get("uid", 1000)
+        # Cập nhật hoặc tạo tiến trình tương ứng
+        if tgid not in self.process_tree:
+            self.update_process(
+                pid=tgid,
+                ppid=event.get("ppid", 0),
+                comm=event.get("comm", ""),
+                uid=event.get("uid", 1000),
+                euid=event.get("euid", 1000),
+                cgroup_id=event.get("cgroup_id", 0),
+                mntns_id=event.get("mntns_id", 0),
+                event_time=ev_ts,
+            )
+        else:
+            self.process_tree[tgid].last_seen = max(self.process_tree[tgid].last_seen, ev_ts)
 
-        self.event_windows[tgid].append((now, event))
-        self._prune_window(tgid, now)
+        # Chèn vào cửa sổ trượt có duy trì thứ tự thời gian (Sorted insertion)
+        window = self.event_windows[tgid]
+        if not window or ev_ts >= window[-1][0]:
+            window.append((ev_ts, event))
+        else:
+            # Sự kiện đến trễ: chèn nhị phân đúng vị trí timestamp
+            timestamps = [entry[0] for entry in window]
+            idx = bisect.bisect_right(timestamps, ev_ts)
+            window.insert(idx, (ev_ts, event))
 
-    def _prune_window(self, tgid: int, current_time: float):
-        """Xóa các sự kiện đã vượt quá kích thước cửa sổ trượt (3s)"""
-        q = self.event_windows[tgid]
-        cutoff = current_time - self.window_size
-        while q and q[0][0] < cutoff:
-            q.popleft()
-        if not q and tgid in self.event_windows:
+        self._prune_window(tgid, ev_ts)
+
+    def _prune_window(self, tgid: int, current_event_time: float):
+        """Loại bỏ các sự kiện có timestamp cũ hơn current_event_time - window_size"""
+        window = self.event_windows.get(tgid)
+        if not window:
+            return
+
+        cutoff = current_event_time - self.window_size
+        # Tìm vị trí sự kiện đầu tiên thỏa mãn >= cutoff
+        while window and window[0][0] < cutoff:
+            window.pop(0)
+
+        if not window and tgid in self.event_windows:
             del self.event_windows[tgid]
 
-    def cleanup_old_processes(self, max_idle_seconds: float = 60.0):
-        """Dọn dẹp các tiến trình đã kết thúc hoặc không còn hoạt động"""
-        now = time.time()
+    def cleanup_old_processes(self, max_idle_seconds: float = 300.0, reference_time: Optional[float] = None):
+        """
+        Dọn dẹp các tiến trình đã kết thúc hoặc không còn hoạt động sau một khoảng thời gian dài an toàn (5 phút).
+        Không xóa tùy tiện trong các khoảng thời gian ngắn để tránh mất dấu vết phả hệ.
+        """
+        ref_ts = reference_time if reference_time is not None else time.time()
         dead_pids = [
             pid for pid, node in self.process_tree.items()
-            if now - node.last_seen > max_idle_seconds
+            if (ref_ts - node.last_seen) > max_idle_seconds
         ]
         for pid in dead_pids:
             self.process_tree.pop(pid, None)
             self.initial_uids.pop(pid, None)
-            self.process_start_times.pop(pid, None)
             self.event_windows.pop(pid, None)
 
     def _find_service_in_lineage(self, proc: ProcessNode, max_depth: int = 5) -> int:
@@ -182,19 +266,28 @@ class FeatureExtractor:
 
     def extract_features(self, tgid: int, current_event: Optional[Dict[str, Any]] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
-        Trích xuất 8 đặc trưng chuẩn hóa:
+        Trích xuất 8 đặc trưng chuẩn hóa dựa trên timestamp sự kiện:
         1. exec_count: Số lần gọi execve trong window
         2. uid_change_flag: 1 nếu chuyển từ UID != 0 sang EUID == 0
         3. is_whitelisted_bin: 1 nếu thuộc danh sách nhị phân hợp lệ, 0 nếu ngoài danh sách
-        4. suspicious_path_flag: 1 nếu chạy từ /tmp, /dev/shm, /var/tmp
+        4. suspicious_path_flag: 1 nếu chạy từ /tmp, /dev/shm, /var/tmp (ranh giới chính xác)
         5. service_parent_flag: 1 nếu cha/tổ tiên là dịch vụ mạng/web/shell
         6. sensitive_file_access: Số lần yêu cầu mở /etc/shadow, /etc/sudoers, /etc/passwd
         7. cap_check_count: Số lần kiểm tra CAP_SETUID, CAP_SYS_ADMIN, etc.
-        8. priv_syscall_rate: Tốc độ gọi syscall nhạy cảm trên giây trong window
+        8. priv_syscall_rate: Tần suất gọi sự kiện nhạy cảm trên giây trong window
         """
-        now = time.time()
-        self._prune_window(tgid, now)
-        events_in_win = [ev for _, ev in self.event_windows.get(tgid, [])]
+        # Xác định mốc thời gian chuẩn từ sự kiện hiện tại hoặc sự kiện mới nhất trong cửa sổ
+        cur_ts = get_event_timestamp(current_event) if current_event else None
+        if cur_ts is None:
+            if self.event_windows.get(tgid):
+                cur_ts = self.event_windows[tgid][-1][0]
+            else:
+                cur_ts = time.time()
+
+        self._prune_window(tgid, cur_ts)
+        window_entries = self.event_windows.get(tgid, [])
+        events_in_win = [entry[1] for entry in window_entries]
+
         if current_event and not any(ev is current_event for ev in events_in_win):
             events_in_win.append(current_event)
 
@@ -234,13 +327,13 @@ class FeatureExtractor:
         if bin_name in WHITELISTED_SUID_BINS:
             is_whitelisted_bin = 1  # 1: Hợp lệ theo chuẩn whitelist
         else:
-            is_whitelisted_bin = 0  # 0: Không thuộc whitelist (cần theo dõi)
+            is_whitelisted_bin = 0  # 0: Ngoài whitelist
 
-        # 4. suspicious_path_flag: 1 nếu chạy từ thư mục tạm nguy hiểm
+        # 4. suspicious_path_flag: 1 nếu thực thi từ thư mục tạm nguy hiểm (so sánh ranh giới chuẩn xác)
         suspicious_path_flag = 0
         for e in events_in_win:
             fn = e.get("filename", "")
-            if any(fn.startswith(p) for p in SUSPICIOUS_PATH_PREFIXES):
+            if is_suspicious_path(fn):
                 suspicious_path_flag = 1
                 break
 
@@ -262,14 +355,14 @@ class FeatureExtractor:
         # 7. cap_check_count: Số lần kiểm tra Capability nhạy cảm (EVENT_CAP_CHECK = 3)
         cap_check_count = sum(1 for e in events_in_win if e.get("event_type") == 3)
 
-        # 8. priv_syscall_rate: Tần suất gọi syscall/sự kiện nhạy cảm trên một giây trong window
-        # Nếu có >= 2 sự kiện, đo khoảng thời gian thực tế giữa sự kiện đầu và cuối trong window
+        # 8. priv_syscall_rate: Tần suất gọi sự kiện nhạy cảm trên giây theo timestamp thực tế
         priv_events_count = len(events_in_win)
         if priv_events_count <= 1:
             priv_syscall_rate = float(priv_events_count) / self.window_size
         else:
-            first_ts = self.event_windows[tgid][0][0] if self.event_windows.get(tgid) else (now - 1.0)
-            duration = max(now - first_ts, 0.1)
+            first_ts = window_entries[0][0] if window_entries else (cur_ts - 1.0)
+            last_ts = window_entries[-1][0] if window_entries else cur_ts
+            duration = max(last_ts - first_ts, 0.1)
             duration = min(duration, self.window_size)
             priv_syscall_rate = float(priv_events_count) / duration
 
