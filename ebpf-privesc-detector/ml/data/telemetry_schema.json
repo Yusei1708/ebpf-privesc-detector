@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LinuxPrivEscTelemetryRecord",
+  "description": "Schema chuẩn cho bản ghi telemetry sự kiện nhân Linux phục vụ huấn luyện và đánh giá mô hình phát hiện leo thang đặc quyền",
+  "type": "object",
+  "required": [
+    "timestamp_iso",
+    "event_type",
+    "tgid",
+    "pid",
+    "ppid",
+    "uid",
+    "euid",
+    "comm",
+    "label"
+  ],
+  "properties": {
+    "timestamp_iso": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Thời gian ghi nhận sự kiện chuẩn ISO-8601 (ví dụ: 2026-10-23T14:30:00.123456Z)"
+    },
+    "timestamp_ns": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Thời gian nanosecond lấy từ bpf_ktime_get_ns() của Linux kernel"
+    },
+    "event_type": {
+      "type": "integer",
+      "enum": [1, 2, 3, 4],
+      "description": "1: sys_enter_execve, 2: commit_creds, 3: cap_capable, 4: sys_enter_openat"
+    },
+    "tgid": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Thread Group ID (Process ID theo góc nhìn userspace)"
+    },
+    "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Thread ID của luồng phát sinh sự kiện"
+    },
+    "ppid": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Process ID của tiến trình cha"
+    },
+    "uid": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Real User ID của tiến trình"
+    },
+    "euid": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Effective User ID của tiến trình"
+    },
+    "cap": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Mã capability khi event_type=3 (ví dụ 10: CAP_SETUID, 21: CAP_SYS_ADMIN)"
+    },
+    "cgroup_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Cgroup v2 ID nhằm nhận diện ranh giới container"
+    },
+    "mntns_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Inode number của Mount Namespace"
+    },
+    "comm": {
+      "type": "string",
+      "maxLength": 16,
+      "description": "Tên ngắn gọn của tiến trình (task comm)"
+    },
+    "filename": {
+      "type": "string",
+      "maxLength": 256,
+      "description": "Đường dẫn nhị phân được thực thi hoặc file nhạy cảm được yêu cầu mở"
+    },
+    "session_id": {
+      "type": "string",
+      "description": "Mã định danh phiên làm việc hoặc kịch bản kiểm thử (để phân tách train/test tránh data leakage)"
+    },
+    "label": {
+      "type": "integer",
+      "enum": [0, 1],
+      "description": "Nhãn gán: 0 là hành vi bình thường (Benign), 1 là tấn công leo thang đặc quyền (Attack)"
+    }
+  }
+}
