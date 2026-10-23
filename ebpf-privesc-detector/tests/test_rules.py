@@ -116,6 +116,47 @@ class TestDetectionRules(unittest.TestCase):
         self.assertTrue(hit)
         self.assertEqual(match.rule_id, "PRIVESC-005")
 
+    def test_rule_privileged_capability_probe_correlated(self):
+        """PRIVESC-006: Bắt kiểm tra capability khi có tín hiệu rủi ro ngữ cảnh (ví dụ: chạy từ /tmp)"""
+        event = {
+            "event_type": 3,  # cap_capable
+            "uid": 1000,
+            "euid": 1000,
+            "comm": "exploit",
+            "cap": 10,  # CAP_SETUID
+        }
+        raw_feat = {
+            "uid_change_flag": 0,
+            "is_whitelisted_bin": 0,
+            "suspicious_path_flag": 1,  # Ngữ cảnh nghi vấn: thực thi từ thư mục tạm
+            "service_parent_flag": 0,
+            "priv_syscall_rate": 0.5,
+        }
+        hit, match = self.detector.evaluate_rules(event, raw_feat)
+        self.assertTrue(hit)
+        self.assertEqual(match.rule_id, "PRIVESC-006")
+        self.assertEqual(match.severity, "MEDIUM")
+
+    def test_rule_privileged_capability_probe_benign_no_context(self):
+        """PRIVESC-006: cap_capable thông thường không có ngữ cảnh rủi ro KHÔNG ĐƯỢC báo động giả"""
+        event = {
+            "event_type": 3,  # cap_capable
+            "uid": 1000,
+            "euid": 1000,
+            "comm": "systemd",
+            "cap": 21,  # CAP_SYS_ADMIN
+        }
+        raw_feat = {
+            "uid_change_flag": 0,
+            "is_whitelisted_bin": 0,
+            "suspicious_path_flag": 0,
+            "service_parent_flag": 0,
+            "priv_syscall_rate": 0.5,  # Tần suất thấp, đường dẫn sạch
+        }
+        hit, match = self.detector.evaluate_rules(event, raw_feat)
+        self.assertFalse(hit)
+        self.assertIsNone(match)
+
     def test_benign_admin_sudo_no_false_positive(self):
         """Hành vi admin dùng sudo hợp lệ KHÔNG ĐƯỢC kích hoạt cảnh báo sai"""
         event = {

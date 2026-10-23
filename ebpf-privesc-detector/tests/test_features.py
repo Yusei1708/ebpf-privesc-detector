@@ -57,11 +57,16 @@ class TestFeatureExtractor(unittest.TestCase):
         self.assertEqual(f2["uid_change_flag"], 1)
 
     def test_suspicious_path_flag(self):
-        """Phát hiện thực thi từ /tmp, /dev/shm, /var/tmp"""
+        """Phát hiện thực thi từ /tmp, /dev/shm, /var/tmp với kiểm tra ranh giới thư mục chính xác"""
         tgid = 300
         ev_tmp = {"event_type": 1, "tgid": tgid, "filename": "/tmp/payload.elf", "comm": "payload"}
         _, f_tmp = self.extractor.extract_features(tgid, ev_tmp)
         self.assertEqual(f_tmp["suspicious_path_flag"], 1)
+
+        # Tránh dương tính giả: /tmpfoo không phải là /tmp/
+        ev_false_prefix = {"event_type": 1, "tgid": 302, "filename": "/tmpfoo/innocent", "comm": "innocent"}
+        _, f_false = self.extractor.extract_features(302, ev_false_prefix)
+        self.assertEqual(f_false["suspicious_path_flag"], 0)
 
         ev_normal = {"event_type": 1, "tgid": 301, "filename": "/usr/bin/git", "comm": "git"}
         _, f_normal = self.extractor.extract_features(301, ev_normal)
@@ -97,34 +102,51 @@ class TestFeatureExtractor(unittest.TestCase):
         _, f = self.extractor.extract_features(tgid)
         self.assertEqual(f["cap_check_count"], 3)
 
-    def test_pid_reuse_handling(self):
-        """Xử lý việc tái sử dụng PID: Reset ngữ cảnh khi phát hiện tiến trình mới trên cùng PID"""
+    def test_reparenting_vs_pid_reuse(self):
+        """Phân biệt an toàn giữa reparenting (tiến trình cha chết) và tái sử dụng PID"""
         tgid = 700
 
-        # Tiến trình 1 cũ: Root daemon
-        self.extractor.update_process(pid=tgid, ppid=1, comm="systemd-daemon", uid=0, euid=0, cgroup_id=0, mntns_id=0)
-        self.extractor.add_event({"event_type": 1, "tgid": tgid, "comm": "daemon"})
-        # Đánh dấu thời gian cũ bằng cách lùi last_seen
-        self.extractor.process_tree[tgid].last_seen = time.time() - 10.0
+        # Bước 1: Tiến trình khởi tạo bởi cha PPID 500
+        self.extractor.update_process(pid=tgid, ppid=500, comm="worker", uid=1000, euid=1000, cgroup_id=0, mntns_id=0, event_time=100.0)
+        self.extractor.add_event({"event_type": 1, "tgid": tgid, "comm": "worker", "timestamp": 100.0})
+        self.assertEqual(len(self.extractor.event_windows[tgid]), 1)
 
-        # Tiến trình 2 mới: Tái sử dụng cùng PID 700 nhưng là user thường với PPID khác
-        self.extractor.update_process(pid=tgid, ppid=999, comm="user-proc", uid=1000, euid=1000, cgroup_id=0, mntns_id=0)
-
-        # Context của PID cũ phải được dọn dẹp, initial_uid phải là 1000
+        # Bước 2: Tiến trình cha PPID 500 chết, Linux reparent tiến trình tgid sang PID 1 (init/systemd)
+        # Đây KHÔNG PHẢI là PID reuse, không được xóa event_windows hay đổi initial_uid!
+        self.extractor.update_process(pid=tgid, ppid=1, comm="worker", uid=1000, euid=1000, cgroup_id=0, mntns_id=0, event_time=101.0)
         self.assertEqual(self.extractor.initial_uids[tgid], 1000)
+        self.assertEqual(len(self.extractor.event_windows[tgid]), 1)
+
+        # Bước 3: Sau đó một tiến trình mới tái sử dụng PID 700 với UID khác (0) hoặc sau idle kéo dài
+        self.extractor.update_process(pid=tgid, ppid=999, comm="root_proc", uid=0, euid=0, cgroup_id=0, mntns_id=0, event_time=120.0)
+        self.assertEqual(self.extractor.initial_uids[tgid], 0)
         self.assertEqual(len(self.extractor.event_windows[tgid]), 0)
 
-    def test_sliding_window_pruning(self):
-        """Kiểm tra cơ chế loại bỏ sự kiện quá hạn 3s trong cửa sổ trượt"""
+    def test_sliding_window_event_timestamp_pruning(self):
+        """Kiểm tra cơ chế trượt cửa sổ dựa trên event timestamp (không dùng time.time())"""
         tgid = 800
-        now = time.time()
-        # Thêm sự kiện cũ hơn 3s
-        self.extractor.event_windows[tgid].append((now - 4.0, {"event_type": 1, "tgid": tgid}))
-        # Thêm sự kiện mới
-        self.extractor.event_windows[tgid].append((now - 1.0, {"event_type": 1, "tgid": tgid}))
+        base_ts = 1000.0
 
-        self.extractor._prune_window(tgid, now)
-        self.assertEqual(len(self.extractor.event_windows[tgid]), 1)
+        # Thêm sự kiện t=1000.0
+        self.extractor.add_event({"event_type": 1, "tgid": tgid, "timestamp": base_ts})
+        # Thêm sự kiện t=1001.0
+        self.extractor.add_event({"event_type": 1, "tgid": tgid, "timestamp": base_ts + 1.0})
+        # Thêm sự kiện đến trễ t=1000.5
+        self.extractor.add_event({"event_type": 1, "tgid": tgid, "timestamp": base_ts + 0.5})
+
+        # Danh sách cửa sổ phải được sắp xếp theo thời gian
+        timestamps = [t for t, _ in self.extractor.event_windows[tgid]]
+        self.assertEqual(timestamps, [1000.0, 1000.5, 1001.0])
+
+        # Khi sự kiện t=1004.0 xuất hiện, sự kiện t=1000.0 và t=1000.5 (cách > 3s) phải bị prune
+        self.extractor.add_event({"event_type": 1, "tgid": tgid, "timestamp": base_ts + 4.0})
+        self.extractor._prune_window(tgid, current_time=base_ts + 4.0)
+
+        remaining_ts = [t for t, _ in self.extractor.event_windows[tgid]]
+        self.assertNotIn(1000.0, remaining_ts)
+        self.assertNotIn(1000.5, remaining_ts)
+        self.assertIn(1001.0, remaining_ts)
+        self.assertIn(1004.0, remaining_ts)
 
     def test_corrupted_and_missing_data(self):
         """Kiểm tra khả năng chịu lỗi khi dữ liệu khuyết thiếu hoặc None"""
