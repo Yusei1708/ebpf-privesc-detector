@@ -1,7 +1,7 @@
 """
 benchmarks/benchmark_agent_vs_auditd.py: Công cụ đo lường hiệu năng định lượng
-So sánh CPU (%), RAM (RSS MB), Tần suất sự kiện và Độ trễ giữa eBPF Agent và Linux Auditd.
-Không ngụy tạo số liệu - Mọi kết quả đo đạc đều được lấy trực tiếp từ /proc/<pid>/stat.
+Đo lường CPU (%) và RAM (RSS MB) từ giao diện /proc/<pid>/stat và /proc/<pid>/status.
+Không ngụy tạo số liệu - Không đo độ trễ hoặc tỷ lệ mất gói giả lập nếu chưa có bộ phát tải tương quan.
 """
 
 import os

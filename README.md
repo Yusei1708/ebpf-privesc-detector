@@ -27,7 +27,7 @@ Repository: [https://github.com/Yusei1708/ebpf-privesc-detector](https://github.
 |                                              |                                                  |
 |                                              v                                                  |
 |                                   [BPF Perf Ring Buffer]                                        |
-|                       (event_t: 200 bytes, 8-byte aligned, zero-copy)                           |
+|                       (event_t: 200 bytes, 8-byte aligned, BPF Ring Buffer)                     |
 +----------------------------------------------|--------------------------------------------------+
                                                |
                                                v (Poll asynchronously)
@@ -48,7 +48,7 @@ Repository: [https://github.com/Yusei1708/ebpf-privesc-detector](https://github.
 |                      - PRIVESC-003 (Suspicious path exec)     - StandardScaler                  |
 |                      - PRIVESC-004 (Service-spawned root)     - Composite Threat Score          |
 |                      - PRIVESC-005 (Sensitive file access)                |                     |
-|                      - PRIVESC-006 (Priv capability abuse)                |                     |
+|                      - PRIVESC-006 (Priv capability probe)                |                     |
 |                                      |                                    |                     |
 |                                      +------------------+-----------------+                     |
 |                                                         |                                       |
@@ -78,7 +78,7 @@ Trong mỗi cửa sổ trượt 3.0 giây (`Sliding Window 3.0s`), hệ thống 
 1. `exec_count`: Số lần gọi `execve` trong cửa sổ thời gian.
 2. `uid_change_flag`: Cờ chuyển đổi đặc quyền (1 nếu `UID != 0` chuyển sang `EUID == 0`).
 3. `is_whitelisted_bin`: `1` nếu nhị phân thuộc danh sách SUID hợp lệ (`sudo`, `su`, `passwd`, `pkexec`), `0` nếu là nhị phân ngoài whitelist (ví dụ: `find`, `python`, `sh`, `vim`).
-4. `suspicious_path_flag`: `1` nếu nhị phân được thực thi từ thư mục tạm nguy hiểm (`/tmp`, `/dev/shm`, `/var/tmp`).
+4. `suspicious_path_flag`: `1` nếu nhị phân được thực thi từ thư mục tạm nguy hiểm (kiểm tra ranh giới thư mục chuẩn xác: `/tmp/`, `/dev/shm/`, `/var/tmp/`, không nhầm lẫn tiền tố như `/tmpfoo`).
 5. `service_parent_flag`: `1` nếu tiến trình cha hoặc tổ tiên thuộc danh sách daemon dịch vụ mạng (`nginx`, `apache2`, `node`, `python`, `php-fpm`).
 6. `sensitive_file_access`: Số lần phát sinh syscall yêu cầu mở file cấu hình nhạy cảm.
 7. `cap_check_count`: Số lần kernel kiểm tra các capability đặc quyền.
@@ -95,7 +95,7 @@ Trong mỗi cửa sổ trượt 3.0 giây (`Sliding Window 3.0s`), hệ thống 
 | **PRIVESC-003** | `RULE_SUSPICIOUS_PATH_PRIV_EXEC`| HIGH | T1059 | Thực thi mã từ `/tmp` hoặc `/dev/shm` với `EUID == 0` ngoài whitelist. |
 | **PRIVESC-004** | `RULE_SERVICE_SPAWNED_ROOT_SHELL`| CRITICAL | T1068 | Tiến trình con của web/network daemon nâng quyền lên root (dấu hiệu Web Shell RCE). |
 | **PRIVESC-005** | `RULE_SENSITIVE_FILE_ACCESS_ATTEMPT`| HIGH | T1003.008 | Yêu cầu mở `/etc/shadow` trong bối cảnh nghi vấn (`/tmp`, con của service, hoặc unwhitelisted root). |
-| **PRIVESC-006** | `RULE_PRIVILEGED_CAPABILITY_ABUSE`| HIGH | T1548 | Tiến trình không đặc quyền kiểm tra capability `CAP_SETUID` hoặc `CAP_SYS_ADMIN`. |
+| **PRIVESC-006** | `RULE_PRIVILEGED_CAPABILITY_PROBE`| MEDIUM | T1548 | Tiến trình không đặc quyền yêu cầu kernel kiểm tra `CAP_SETUID`/`CAP_SYS_ADMIN` kèm tín hiệu rủi ro ngữ cảnh (đường dẫn `/tmp`, con của service, hoặc tần suất cao). |
 
 ---
 
@@ -181,3 +181,4 @@ python ebpf-privesc-detector/benchmarks/benchmark_agent_vs_auditd.py --pid $(pgr
 1. **Ranh giới Syscall Entry vs Exit**: Hiện tại probe gắn tại `sys_enter_*` nhằm phát hiện sớm ý định trước khi tiến trình kịp thực thi mã độc. Do đó, probe không nhận biết được mã trả về (return value) của syscall nếu lệnh thất bại sau đó.
 2. **Kỹ thuật Tấn công DKOM (Direct Kernel Object Manipulation)**: Nếu kẻ tấn công khai thác lỗ hổng kernel cấp zero-day để ghi trực tiếp vào vùng nhớ `struct cred` trong RAM mà không thông qua hàm `commit_creds()`, kprobe tại `commit_creds` sẽ không được kích hoạt.
 3. **Thời gian khởi động ban đầu của BCC**: BCC thực hiện biên dịch mã nguồn C eBPF sang bytecode Clang/LLVM JIT tại runtime, mất từ 1-3 giây khi khởi động Agent trước khi gắn probe vào Kernel.
+4. **Giới hạn quan sát của kprobe/cap_capable**: Điểm hook `cap_capable` chỉ quan sát thời điểm kernel thực hiện kiểm tra quyền (capability audit check entry). Sự kiện này không đồng nghĩa với việc capability đã được cấp hay bị từ chối. Vì vậy hệ thống chỉ dùng tín hiệu này làm ngữ cảnh tương quan hoặc cảnh báo mức MEDIUM khi có dấu hiệu rủi ro đi kèm, tránh tạo cảnh báo sai độc lập.

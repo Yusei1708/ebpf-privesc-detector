@@ -1,9 +1,9 @@
 # Hướng Dẫn Thực Nghiệm & Đo Kiểm Hiệu Năng Đối Chuẩn: eBPF Agent vs Linux Auditd
 
-Tài liệu này cung cấp quy trình thực nghiệm có thể tái hiện 100% để đo lường định lượng và so sánh mức tiêu hao tài nguyên (CPU %, RAM RSS, Độ trễ và Tỷ lệ mất sự kiện) giữa **eBPF PrivEsc Detector** và **Linux Audit Daemon (`auditd`)**.
+Tài liệu này cung cấp quy trình thực nghiệm có thể tái hiện để đo lường định lượng và so sánh mức tiêu hao tài nguyên (CPU %, RAM RSS) giữa **eBPF PrivEsc Detector** và **Linux Audit Daemon (`auditd`)**, đồng thời hướng dẫn phương pháp quan sát tỷ lệ rớt sự kiện và độ trễ.
 
 > [!IMPORTANT]
-> **Nguyên tắc Khoa học & Trung thực**: Không ngụy tạo số liệu hoặc đưa ra các tuyên bố thiếu căn cứ như "tiêu hao dưới 1% CPU" hay "hoàn toàn không độ trễ". Mọi số liệu trong báo cáo phải được lấy từ các bài đo thực tế trên phần cứng xác định.
+> **Nguyên tắc Khoa học & Trung thực**: Không ngụy tạo số liệu hoặc đưa ra các tuyên bố thiếu căn cứ như "tiêu hao dưới 1% CPU", "zero-copy", hay "hoàn toàn không độ trễ". Script `benchmark_agent_vs_auditd.py` tập trung đo lường chính xác CPU (%) và RAM RSS (MB) từ `/proc`. Mọi số liệu trong báo cáo phải được lấy từ các bài đo thực tế trên phần cứng xác định.
 
 ---
 
@@ -93,15 +93,15 @@ python benchmarks/benchmark_agent_vs_auditd.py \
 
 Sau khi hoàn thành các bài đo trên máy của bạn, điền kết quả vào bảng dưới đây:
 
-| Tiêu Chí Đo Lường | Linux `auditd` | eBPF PrivEsc Detector | Ghi Chú & Nhận Xét |
+| Tiêu Chí Đo Lường | Linux `auditd` | eBPF PrivEsc Detector | Phương Pháp Đo Đạc & Ghi Chú |
 | :--- | :--- | :--- | :--- |
-| **CPU Trung bình (%)** | *[Điền kết quả]* | *[Điền kết quả]* | Đo trong lúc chạy `stress-ng --exec 4` |
-| **CPU Đỉnh (%)** | *[Điền kết quả]* | *[Điền kết quả]* | Tải cực đại khi có burst syscall |
-| **RAM (RSS MB)** | *[Điền kết quả]* | *[Điền kết quả]* | Dung lượng bộ nhớ vật lý chiếm dụng |
-| **Số sự kiện xử lý (Events/s)**| *[Điền kết quả]* | *[Điền kết quả]* | Throughput tối đa trước khi nghẽn |
-| **Tỷ lệ rớt sự kiện (Drop Rate %)**| *[Điền kết quả]* | *[Điền kết quả]* | Xem qua `auditctl -s` vs BPF ringbuffer drops |
-| **Độ trễ phát hiện (Latency)**| *[Điền kết quả]* | *[Điền kết quả]* | Thời gian từ lúc syscall xảy ra đến khi có alert |
-| **Tác động đến I/O máy chủ** | Ghi log đĩa liên tục | Xử lý in-memory, chỉ log khi có alert | Phân tích cơ chế I/O |
+| **CPU Trung bình (%)** | *[Điền kết quả]* | *[Điền kết quả]* | Tự động đo qua `benchmark_agent_vs_auditd.py` |
+| **CPU Đỉnh (%)** | *[Điền kết quả]* | *[Điền kết quả]* | Tự động đo qua `benchmark_agent_vs_auditd.py` |
+| **RAM (RSS MB)** | *[Điền kết quả]* | *[Điền kết quả]* | Tự động đo qua `benchmark_agent_vs_auditd.py` |
+| **Số sự kiện xử lý (Events/s)**| *[Điền kết quả]* | *[Điền kết quả]* | Đếm số dòng log sinh ra / thời gian đo |
+| **Tỷ lệ rớt sự kiện (Drop Rate %)**| *[Điền kết quả]* | *[Điền kết quả]* | `auditctl -s` (lost) vs BPF perf buffer drops |
+| **Độ trễ phát hiện (Latency)**| *[Điền kết quả]* | *[Điền kết quả]* | Chênh lệch giữa timestamp syscall và timestamp alert |
+| **Tác động đến I/O máy chủ** | Ghi log đĩa liên tục | Xử lý in-memory, chỉ log khi có alert | Quan sát qua `iotop` hoặc `vmstat` |
 
 ---
 
