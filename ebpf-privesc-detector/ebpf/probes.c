@@ -1,10 +1,18 @@
 /*
  * Linux Privilege Escalation Detector - eBPF Probe Program
- * Hooks:
- *  - tracepoint/syscalls/sys_enter_execve
- *  - kprobe/commit_creds
- *  - kprobe/cap_capable
- *  - tracepoint/syscalls/sys_enter_openat
+ *
+ * Observability Boundaries & Disclaimer:
+ * 1. tracepoint/syscalls/sys_enter_execve:
+ *    - Observes invocation ATTEMPTS of execve with arguments and caller credentials.
+ *    - Does NOT conclude whether execve succeeded or failed (e.g., -ENOENT, -EACCES).
+ * 2. kprobe/commit_creds:
+ *    - Observes the installation of new struct cred for the current task.
+ * 3. kprobe/cap_capable:
+ *    - Observes when the kernel audits a specific capability for an operation.
+ *    - Does NOT determine whether the permission was ultimately granted or denied.
+ * 4. tracepoint/syscalls/sys_enter_openat:
+ *    - Observes the intent/attempt to open a specific path.
+ *    - Does NOT mean the file was successfully opened or read (e.g. may return -EACCES).
  */
 
 #include <uapi/linux/ptrace.h>
@@ -23,29 +31,32 @@
 #define PATH_MAX_LEN        128
 
 /*
- * Struct transferred from Kernel eBPF probe to User Space Agent
+ * Struct transferred from Kernel eBPF probe to User Space Agent.
+ * Explicitly aligned to 8-byte boundary to avoid architecture/compiler padding discrepancies.
+ * Total size: 8 * 4 (32) + 3 * 8 (24) + 16 + 128 = 200 bytes.
  */
 struct event_t {
-    u32 event_type;         /* EVENT_EXECVE, EVENT_COMMIT_CREDS, ... */
-    u32 pid;                /* Thread ID */
-    u32 tgid;               /* Process ID */
-    u32 ppid;               /* Parent Process ID */
-    u32 uid;                /* Real UID */
-    u32 euid;               /* Effective UID */
-    u32 cap;                /* Capability checked (if CAP_CHECK) */
-    u64 cgroup_id;          /* Cgroup v2 ID (distinguishes containers) */
-    u64 mntns_id;           /* Mount namespace inode number */
-    u64 timestamp_ns;       /* Kernel timestamp in nanoseconds */
-    char comm[TASK_COMM_LEN]; /* Executable name */
-    char filename[PATH_MAX_LEN]; /* Executed binary or accessed file path */
-};
+    u32 event_type;             /* EVENT_EXECVE, EVENT_COMMIT_CREDS, ... */
+    u32 pid;                    /* Thread ID */
+    u32 tgid;                   /* Process ID */
+    u32 ppid;                   /* Parent Process ID */
+    u32 uid;                    /* Real UID (from task credentials) */
+    u32 euid;                   /* Effective UID (from task credentials) */
+    u32 cap;                    /* Capability checked (if CAP_CHECK) */
+    u32 _pad;                   /* Explicit padding for 8-byte alignment */
+    u64 cgroup_id;              /* Cgroup v2 ID (distinguishes containers) */
+    u64 mntns_id;               /* Mount namespace inode number */
+    u64 timestamp_ns;           /* Kernel monotonic timestamp in nanoseconds */
+    char comm[TASK_COMM_LEN];   /* Executable name */
+    char filename[PATH_MAX_LEN];/* Executed binary or accessed file path */
+} __attribute__((aligned(8)));
 
 BPF_PERF_OUTPUT(events);
 
 /* Helper to safely retrieve PPID from task_struct */
 static inline u32 get_ppid(struct task_struct *task) {
     u32 ppid = 0;
-    struct task_struct *parent;
+    struct task_struct *parent = NULL;
     bpf_probe_read_kernel(&parent, sizeof(parent), &task->real_parent);
     if (parent) {
         bpf_probe_read_kernel(&ppid, sizeof(ppid), &parent->tgid);
@@ -56,8 +67,8 @@ static inline u32 get_ppid(struct task_struct *task) {
 /* Helper to safely retrieve Mount Namespace Inode Number */
 static inline u64 get_mntns_id(struct task_struct *task) {
     u64 mntns_id = 0;
-    struct nsproxy *nsproxy;
-    struct mnt_namespace *mnt_ns;
+    struct nsproxy *nsproxy = NULL;
+    struct mnt_namespace *mnt_ns = NULL;
 
     bpf_probe_read_kernel(&nsproxy, sizeof(nsproxy), &task->nsproxy);
     if (nsproxy) {
@@ -70,8 +81,26 @@ static inline u64 get_mntns_id(struct task_struct *task) {
 }
 
 /*
+ * Helper to safely extract both Real UID and Effective UID from task_struct->cred.
+ * NOTE: bpf_get_current_uid_gid() returns (GID << 32) | UID. It does NOT provide EUID!
+ * We must read cred->euid.val directly from kernel memory.
+ */
+static inline void fill_task_uids(struct task_struct *task, u32 *out_uid, u32 *out_euid) {
+    const struct cred *cred = NULL;
+    bpf_probe_read_kernel(&cred, sizeof(cred), &task->cred);
+    if (cred) {
+        bpf_probe_read_kernel(out_uid, sizeof(*out_uid), &cred->uid.val);
+        bpf_probe_read_kernel(out_euid, sizeof(*out_euid), &cred->euid.val);
+    } else {
+        u64 uid_gid = bpf_get_current_uid_gid();
+        *out_uid = (u32)uid_gid;
+        *out_euid = (u32)uid_gid; // Fallback if cred pointer cannot be dereferenced
+    }
+}
+
+/*
  * 1. Hook sys_enter_execve
- * Captures process execution, arguments, caller identity, and namespaces
+ * Observes process execution attempt, requested binary path, and namespaces.
  */
 TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
     struct event_t event = {};
@@ -82,9 +111,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
     event.tgid = (u32)(id >> 32);
     event.ppid = get_ppid(task);
 
-    u64 uid_gid = bpf_get_current_uid_gid();
-    event.uid = (u32)uid_gid;
-    event.euid = (u32)(uid_gid >> 32);
+    fill_task_uids(task, &event.uid, &event.euid);
 
     event.event_type = EVENT_EXECVE;
     event.cgroup_id = bpf_get_current_cgroup_id();
@@ -100,15 +127,16 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
 
 /*
  * 2. Hook commit_creds
- * Detects credential elevation (e.g., EUID jumping to 0)
+ * Observes credential transition (e.g. non-root task becoming root EUID=0).
  */
 int kprobe__commit_creds(struct pt_regs *ctx, struct cred *new) {
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    u64 uid_gid = bpf_get_current_uid_gid();
-    u32 current_uid = (u32)uid_gid;
-    u32 current_euid = (u32)(uid_gid >> 32);
+    u32 current_uid = 0;
+    u32 current_euid = 0;
+    fill_task_uids(task, &current_uid, &current_euid);
 
-    u32 new_uid = 0, new_euid = 0;
+    u32 new_uid = 0;
+    u32 new_euid = 0;
     bpf_probe_read_kernel(&new_uid, sizeof(new_uid), &new->uid.val);
     bpf_probe_read_kernel(&new_euid, sizeof(new_euid), &new->euid.val);
 
@@ -149,9 +177,7 @@ int kprobe__cap_capable(struct pt_regs *ctx, const struct cred *cred, struct use
         event.tgid = (u32)(id >> 32);
         event.ppid = get_ppid(task);
 
-        u64 uid_gid = bpf_get_current_uid_gid();
-        event.uid = (u32)uid_gid;
-        event.euid = (u32)(uid_gid >> 32);
+        fill_task_uids(task, &event.uid, &event.euid);
 
         event.cap = (u32)cap;
         event.event_type = EVENT_CAP_CHECK;
@@ -168,7 +194,8 @@ int kprobe__cap_capable(struct pt_regs *ctx, const struct cred *cred, struct use
 
 /*
  * 4. Hook sys_enter_openat
- * Filters and alerts on access to sensitive identity/privilege files (/etc/shadow, /etc/sudoers, /etc/passwd)
+ * Observes attempts to open sensitive configuration/shadow files.
+ * NOTE: This is entry only; permission checks in VFS happen later in kernel.
  */
 TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
     char path[PATH_MAX_LEN] = {};
@@ -196,9 +223,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
             event.tgid = (u32)(id >> 32);
             event.ppid = get_ppid(task);
 
-            u64 uid_gid = bpf_get_current_uid_gid();
-            event.uid = (u32)uid_gid;
-            event.euid = (u32)(uid_gid >> 32);
+            fill_task_uids(task, &event.uid, &event.euid);
 
             event.event_type = EVENT_OPENAT;
             event.cgroup_id = bpf_get_current_cgroup_id();
