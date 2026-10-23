@@ -150,15 +150,46 @@ def train_models(telemetry_file: Optional[str] = None, check_only: bool = False)
         data_source = "Synthetic Baseline Simulation (Grouped Sessions)"
 
     print(f"[+] Tổng số mẫu dữ liệu: {len(df)} (Bình thường: {sum(df['label'] == 0)}, Tấn công: {sum(df['label'] == 1)})")
-    print(f"[+] Số phiên (sessions): {df['session_id'].nunique()}")
+    n_sessions = df['session_id'].nunique()
+    print(f"[+] Số phiên (sessions): {n_sessions}")
+
+    # 1. Kiểm tra tính toàn vẹn và cân bằng dữ liệu đầu vào
+    if len(df) < 10:
+        raise ValueError(f"Tập dữ liệu quá nhỏ ({len(df)} mẫu). Cần tối thiểu 10 mẫu để huấn luyện và kiểm thử.")
+
+    if n_sessions < 2:
+        raise ValueError(
+            f"Tập dữ liệu cần ít nhất 2 session_id độc lập để phân chia train/test theo nhóm (GroupShuffleSplit). "
+            f"Hiện tại chỉ có {n_sessions} session."
+        )
+
+    unique_labels = set(df["label"].unique())
+    if unique_labels != {0, 1}:
+        raise ValueError(
+            f"Tập dữ liệu phải chứa đầy đủ cả 2 lớp nhãn: 0 (Benign) và 1 (Attack). "
+            f"Các nhãn hiện có trong dữ liệu: {sorted(list(unique_labels))}."
+        )
 
     if check_only:
-        print("[✓] Kiểm tra cú pháp và dữ liệu hoàn tất (Check-only mode).")
+        print("[✓] Kiểm tra cú pháp và tính hợp lệ dữ liệu hoàn tất (Check-only mode).")
         return
 
-    # Phân chia train/test theo GroupShuffleSplit dựa trên session_id nhằm chống rò rỉ dữ liệu (Data Leakage)
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42)
-    train_idx, test_idx = next(gss.split(df, groups=df["session_id"]))
+    # 2. Phân chia train/test theo GroupShuffleSplit dựa trên session_id nhằm chống rò rỉ dữ liệu (Data Leakage)
+    # Lặp thử nghiệm một số random_state để tìm phân chia mà cả tập train và test đều có đủ 2 lớp
+    gss = GroupShuffleSplit(n_splits=10, test_size=0.25, random_state=42)
+    train_idx, test_idx = None, None
+    for tr_idx, te_idx in gss.split(df, groups=df["session_id"]):
+        tr_df = df.iloc[tr_idx]
+        te_df = df.iloc[te_idx]
+        if tr_df["label"].nunique() >= 2 and te_df["label"].nunique() >= 2:
+            train_idx, test_idx = tr_idx, te_idx
+            break
+
+    if train_idx is None:
+        raise ValueError(
+            "Không thể phân chia tập dữ liệu thành train và test có đầy đủ cả 2 lớp (Benign và Attack) "
+            "dựa trên các session_id hiện có. Vui lòng cung cấp thêm các session chứa tấn công và session bình thường độc lập."
+        )
 
     train_df = df.iloc[train_idx]
     test_df = df.iloc[test_idx]
@@ -170,12 +201,12 @@ def train_models(telemetry_file: Optional[str] = None, check_only: bool = False)
 
     print(f"[*] Tập huấn luyện: {len(train_df)} mẫu | Tập kiểm thử độc lập: {len(test_df)} mẫu")
 
-    # 1. Chuẩn hóa dữ liệu bằng StandardScaler
+    # 3. Chuẩn hóa dữ liệu bằng StandardScaler
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    # 2. Huấn luyện Random Forest Classifier (Supervised)
+    # 4. Huấn luyện Random Forest Classifier (Supervised)
     print("\n[*] Đang huấn luyện Random Forest Classifier...")
     rf_model = RandomForestClassifier(
         n_estimators=100,
@@ -190,8 +221,13 @@ def train_models(telemetry_file: Optional[str] = None, check_only: bool = False)
     # Đánh giá Random Forest
     rf_pred = rf_model.predict(X_test_scaled)
     rf_proba = rf_model.predict_proba(X_test_scaled)[:, 1]
-    rf_auc = roc_auc_score(y_test, rf_proba)
-    cm = confusion_matrix(y_test, rf_pred)
+
+    if len(np.unique(y_test)) >= 2 and rf_proba.ndim == 1:
+        rf_auc = float(roc_auc_score(y_test, rf_proba))
+    else:
+        rf_auc = 0.0
+
+    cm = confusion_matrix(y_test, rf_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
 
     fpr = float(fp) / float(fp + tn) if (fp + tn) > 0 else 0.0
@@ -200,8 +236,12 @@ def train_models(telemetry_file: Optional[str] = None, check_only: bool = False)
     recall = float(tp) / float(tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
 
+    if telemetry_file is None:
+        print("\n[!] LƯU Ý QUAN TRỌNG: Kết quả đánh giá dưới đây được tính toán trên dữ liệu MÔ PHỎNG (Synthetic Baseline) "
+              "phục vụ cold-start. Đây KHÔNG phải là bằng chứng hiệu quả trên hệ thống production thực tế.")
+
     print("\n--- KẾT QUẢ ĐÁNH GIÁ RANDOM FOREST TRÊN TẬP KIỂM THỬ ĐỘC LẬP ---")
-    print(classification_report(y_test, rf_pred, target_names=["Benign", "Attack"]))
+    print(classification_report(y_test, rf_pred, target_names=["Benign", "Attack"], labels=[0, 1]))
     print(f"ROC-AUC Score:          {rf_auc:.4f}")
     print(f"False Positive Rate (FPR): {fpr * 100:.2f}%")
     print(f"False Negative Rate (FNR): {fnr * 100:.2f}%")
@@ -214,10 +254,16 @@ def train_models(telemetry_file: Optional[str] = None, check_only: bool = False)
     for name, imp in sorted(zip(FEATURE_NAMES, importances), key=lambda x: x[1], reverse=True):
         print(f"  - {name:<25}: {imp * 100:.2f}%")
 
-    # 3. Huấn luyện Isolation Forest (Unsupervised Anomaly Detection)
+    # 5. Huấn luyện Isolation Forest (Unsupervised Anomaly Detection)
     # Chỉ fit trên các mẫu bình thường (Benign) của tập train
     print("\n[*] Đang huấn luyện Isolation Forest (Anomaly Detection)...")
     X_train_benign = X_train_scaled[y_train == 0]
+    if len(X_train_benign) < 5:
+        raise ValueError(
+            f"Tập huấn luyện cần tối thiểu 5 mẫu bình thường (Benign, label=0) cho Isolation Forest. "
+            f"Hiện tại chỉ có {len(X_train_benign)} mẫu."
+        )
+
     iso_model = IsolationForest(
         n_estimators=120,
         contamination=0.03,
@@ -226,7 +272,7 @@ def train_models(telemetry_file: Optional[str] = None, check_only: bool = False)
     )
     iso_model.fit(X_train_benign)
 
-    # 4. Lưu lại Models, Scaler và Metadata
+    # 6. Lưu lại Models, Scaler và Metadata
     scaler_path = MODELS_DIR / "scaler.joblib"
     rf_path = MODELS_DIR / "random_forest.joblib"
     iso_path = MODELS_DIR / "isolation_forest.joblib"
@@ -282,7 +328,24 @@ def main():
     parser.add_argument("--check-only", action="store_true", help="Chỉ kiểm tra tính hợp lệ của dữ liệu mà không ghi đè model")
     args = parser.parse_args()
 
-    train_models(telemetry_file=args.telemetry_file, check_only=args.check_only)
+    try:
+        train_models(telemetry_file=args.telemetry_file, check_only=args.check_only)
+    except FileNotFoundError as e:
+        print(f"\n[!] LỖI TỆP TIN: {e}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as e:
+        print(f"\n[!] LỖI DỮ LIỆU HUẤN LUYỆN: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        try:
+            from ml.telemetry_loader import TelemetryValidationError
+            if isinstance(e, TelemetryValidationError):
+                print(f"\n[!] LỖI XÁC THỰC TELEMETRY (Dòng {e.line_number}, Trường '{e.field}'): {e.message}", file=sys.stderr)
+                sys.exit(1)
+        except ImportError:
+            pass
+        print(f"\n[!] LỖI TRONG QUÁ TRÌNH HUẤN LUYỆN: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

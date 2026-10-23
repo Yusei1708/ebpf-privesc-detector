@@ -66,6 +66,16 @@ class TelemetryLoader:
         if not isinstance(record, dict):
             raise TelemetryValidationError(line_no, "root", f"Bản ghi phải là đối tượng JSON/Dict, nhận được {type(record).__name__}")
 
+        # Kiểm tra nếu người dùng nhầm lẫn truyền file cảnh báo (Alert log)
+        if "threat_score" in record or "matched_rules" in record:
+            raise TelemetryValidationError(
+                line_no,
+                "format",
+                "File này có cấu trúc Alert Log (chứa 'threat_score' hoặc 'matched_rules'), không phải Telemetry có nhãn ground-truth. "
+                "Alert log không thể dùng trực tiếp để huấn luyện mô hình. Vui lòng thu thập telemetry có gán nhãn theo ml/data/telemetry_schema.json.",
+                record
+            )
+
         # 1. Kiểm tra sự tồn tại của các trường bắt buộc
         for req in self.REQUIRED_FIELDS:
             if req not in record or record[req] is None or (isinstance(record[req], str) and not record[req].strip()):

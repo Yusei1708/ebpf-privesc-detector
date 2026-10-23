@@ -12,6 +12,7 @@
     "uid",
     "euid",
     "comm",
+    "session_id",
     "label"
   ],
   "properties": {
