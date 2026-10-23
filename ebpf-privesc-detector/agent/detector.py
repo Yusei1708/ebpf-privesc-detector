@@ -20,7 +20,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent.features import FEATURE_NAMES, WHITELISTED_SUID_BINS, SUSPICIOUS_PATH_PREFIXES, SERVICE_PARENT_NAMES, FeatureExtractor
+from agent.features import (
+    FEATURE_NAMES,
+    WHITELISTED_SUID_BINS,
+    SUSPICIOUS_DIRECTORIES,
+    SERVICE_PARENT_NAMES,
+    FeatureExtractor,
+    is_suspicious_path,
+)
 from agent.alert_logger import AlertLogger
 
 # Sử dụng Rich để in giao diện cảnh báo đẹp mắt trên Terminal
@@ -155,16 +162,22 @@ class PrivEscDetector:
                         rationale="Quan sát thấy syscall sys_enter_openat truy cập thông tin hash mật khẩu hoặc phân quyền sudo.",
                     )
 
-        # 6. PRIVESC-006: Lạm dụng Capability nhạy cảm (CAP_SETUID / CAP_SYS_ADMIN)
+        # 6. PRIVESC-006: Kiểm tra Capability đặc quyền trong bối cảnh nghi vấn
+        # LƯU Ý QUAN TRỌNG VỀ OBSERVABILITY:
+        # Sự kiện kprobe cap_capable chỉ quan sát việc kernel thực hiện kiểm tra quyền (audit check),
+        # KHÔNG khẳng định quyền đó được chấp thuận (allow) hay bị từ chối (deny/EPERM).
+        # Nhiều ứng dụng người dùng thông thường cũng có thể kích hoạt kiểm tra này trong glibc.
+        # Để tránh cảnh báo sai, chỉ phát tín hiệu khi có thêm bối cảnh bất thường:
+        # thực thi từ thư mục tạm, tiến trình con của web service, hoặc đi kèm nhảy quyền EUID.
         if e_type == 3 and event.get("cap") in (10, 21):  # CAP_SETUID (10), CAP_SYS_ADMIN (21)
-            if uid != 0 and is_whitelisted == 0:
+            if is_whitelisted == 0 and (suspicious_path == 1 or service_parent == 1 or uid_change == 1 or raw_features.get("cap_check_count", 0) >= 5):
                 return True, RuleMatch(
                     rule_id="PRIVESC-006",
-                    name="RULE_PRIVILEGED_CAPABILITY_ABUSE",
-                    severity="HIGH",
+                    name="RULE_PRIVILEGED_CAPABILITY_PROBE",
+                    severity="MEDIUM",
                     mitre_id="T1548",
-                    description=f"Tiến trình người dùng ({comm}) kiểm tra capability đặc quyền (CAP={event.get('cap')})",
-                    rationale="Tiến trình không thuộc whitelist kiểm tra khả năng thay đổi UID hoặc can thiệp sâu vào kernel.",
+                    description=f"Tiến trình nghi vấn ({comm}) kiểm tra capability đặc quyền (CAP={event.get('cap')}) trong bối cảnh rủi ro",
+                    rationale="Quan sát thấy kiểm tra capability nhạy cảm kết hợp với thư mục tạm hoặc phả hệ service. Lưu ý probe chỉ ghi nhận kiểm tra tại entry, không xác nhận quyền đã được cấp.",
                 )
 
         return False, None
