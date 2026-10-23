@@ -2,11 +2,14 @@
 agent/detector.py: Công cụ phân tích và cảnh báo tấn công leo thang đặc quyền 2 tầng
   - Tầng 1 (Rule-based Fast Path): Bắt ngay lập tức các hành vi nhảy EUID=0, lạm dụng SUID, đọc trộm file nhạy cảm
   - Tầng 2 (ML-based Scoring): Chấm điểm bất thường và xác suất tấn công qua Random Forest & Isolation Forest
+  - Tích hợp AlertLogger xuất file JSONL an toàn
 """
 
 import os
 import sys
 import argparse
+import tempfile
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
@@ -18,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from agent.features import FEATURE_NAMES, WHITELISTED_SUID_BINS, SUSPICIOUS_PATH_PREFIXES, SERVICE_PARENT_NAMES, FeatureExtractor
+from agent.alert_logger import AlertLogger
 
 # Sử dụng Rich để in giao diện cảnh báo đẹp mắt trên Terminal
 try:
@@ -43,13 +47,14 @@ class RuleMatch:
 
 class PrivEscDetector:
     """
-    Hệ thống phát hiện tấn công tích hợp Rule-based Engine và Machine Learning
+    Hệ thống phát hiện tấn công tích hợp Rule-based Engine, Machine Learning và JSONL Alert Logging
     """
-    def __init__(self, models_dir: Optional[str] = None):
+    def __init__(self, models_dir: Optional[str] = None, alert_log_path: Optional[str] = None):
         self.models_dir = Path(models_dir) if models_dir else (PROJECT_ROOT / "ml" / "models")
         self.scaler = None
         self.rf_model = None
         self.iso_model = None
+        self.logger = AlertLogger(alert_log_path) if alert_log_path else None
         self._load_models()
 
     def _load_models(self):
@@ -193,6 +198,7 @@ class PrivEscDetector:
                 extractor: Optional[FeatureExtractor] = None) -> Optional[Dict[str, Any]]:
         """
         Kết hợp 2 tầng phân tích để đưa ra quyết định cảnh báo toàn diện.
+        Ghi log ra file JSONL nếu self.logger được cấu hình.
         Trả về alert_data nếu phát hiện bất thường, ngược lại trả về None.
         """
         rule_hit, match = self.evaluate_rules(event, raw_features)
@@ -220,7 +226,14 @@ class PrivEscDetector:
                 "iso_score": iso_score,
                 "threat_score": threat_score,
             }
+
+            # In bảng cảnh báo Terminal
             self.display_alert(event, raw_features, rule_name, rule_sev, rf_prob, iso_score, threat_score, extractor)
+
+            # Ghi log cảnh báo có cấu trúc JSONL an toàn
+            if self.logger:
+                self.logger.log_alert(alert_data)
+
             return alert_data
 
         return None
@@ -276,114 +289,137 @@ class PrivEscDetector:
 
 
 def run_test_alert():
-    """Hàm tự kiểm thử bộ cảnh báo với dữ liệu giả lập sử dụng Assertion chặt chẽ"""
+    """Hàm tự kiểm thử bộ cảnh báo với dữ liệu giả lập sử dụng Assertion chặt chẽ và kiểm tra AlertLogger"""
     print("[*] Đang chạy kiểm thử bộ phân tích PrivEscDetector với các kịch bản mẫu và kiểm chứng Assertion...")
-    detector = PrivEscDetector()
 
-    # Kịch bản 1: SUID Abuse (find gán SUID gọi /bin/sh)
-    print("\n--- Test Case 1: SUID Abuse (/usr/bin/find spawning shell with EUID=0) ---")
-    event_1 = {
-        "event_type": 1,
-        "pid": 54321,
-        "tgid": 54320,
-        "ppid": 1000,
-        "uid": 1000,
-        "euid": 0,
-        "cgroup_id": 4096,
-        "mntns_id": 4026531840,
-        "comm": "find",
-        "filename": "/usr/bin/find",
-    }
-    raw_feat_1 = {
-        "exec_count": 4,
-        "uid_change_flag": 1,
-        "is_whitelisted_bin": 0,  # 0: unwhitelisted SUID abuse
-        "suspicious_path_flag": 0,
-        "service_parent_flag": 0,
-        "sensitive_file_access": 1,
-        "cap_check_count": 2,
-        "priv_syscall_rate": 3.5,
-    }
-    feat_vec_1 = np.array([4, 1, 0, 0, 0, 1, 2, 3.5], dtype=np.float32)
-    res_1 = detector.analyze(event_1, feat_vec_1, raw_feat_1)
+    # Sử dụng file log tạm thời để kiểm chứng tính năng AlertLogger
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as tmp_log:
+        tmp_log_path = tmp_log.name
 
-    assert res_1 is not None, "Assertion Error: Case 1 không kích hoạt được cảnh báo!"
-    assert res_1["rule_name"] == "RULE_GTFOBINS_SUID_ABUSE", f"Sai luật: {res_1['rule_name']}"
-    assert res_1["threat_score"] >= 80, f"Threat score quá thấp: {res_1['threat_score']}"
+    try:
+        detector = PrivEscDetector(alert_log_path=tmp_log_path)
 
-    # Kịch bản 2: Exploit từ thư mục /tmp đọc /etc/shadow
-    print("\n--- Test Case 2: Exploit Drop trong /tmp đọc trộm /etc/shadow ---")
-    event_2 = {
-        "event_type": 4,
-        "pid": 55112,
-        "tgid": 55110,
-        "ppid": 2040,
-        "uid": 1000,
-        "euid": 0,
-        "cgroup_id": 8192,
-        "mntns_id": 4026532200,
-        "comm": "exploit",
-        "filename": "/etc/shadow",
-    }
-    raw_feat_2 = {
-        "exec_count": 6,
-        "uid_change_flag": 1,
-        "is_whitelisted_bin": 0,  # unwhitelisted
-        "suspicious_path_flag": 1,
-        "service_parent_flag": 0,
-        "sensitive_file_access": 2,
-        "cap_check_count": 3,
-        "priv_syscall_rate": 5.0,
-    }
-    feat_vec_2 = np.array([6, 1, 0, 1, 0, 2, 3, 5.0], dtype=np.float32)
-    res_2 = detector.analyze(event_2, feat_vec_2, raw_feat_2)
+        # Kịch bản 1: SUID Abuse (find gán SUID gọi /bin/sh)
+        print("\n--- Test Case 1: SUID Abuse (/usr/bin/find spawning shell with EUID=0) ---")
+        event_1 = {
+            "event_type": 1,
+            "pid": 54321,
+            "tgid": 54320,
+            "ppid": 1000,
+            "uid": 1000,
+            "euid": 0,
+            "cgroup_id": 4096,
+            "mntns_id": 4026531840,
+            "comm": "find",
+            "filename": "/usr/bin/find",
+        }
+        raw_feat_1 = {
+            "exec_count": 4,
+            "uid_change_flag": 1,
+            "is_whitelisted_bin": 0,  # 0: unwhitelisted SUID abuse
+            "suspicious_path_flag": 0,
+            "service_parent_flag": 0,
+            "sensitive_file_access": 1,
+            "cap_check_count": 2,
+            "priv_syscall_rate": 3.5,
+        }
+        feat_vec_1 = np.array([4, 1, 0, 0, 0, 1, 2, 3.5], dtype=np.float32)
+        res_1 = detector.analyze(event_1, feat_vec_1, raw_feat_1)
 
-    assert res_2 is not None, "Assertion Error: Case 2 không kích hoạt được cảnh báo!"
-    assert res_2["threat_score"] >= 80, f"Threat score quá thấp: {res_2['threat_score']}"
+        assert res_1 is not None, "Assertion Error: Case 1 không kích hoạt được cảnh báo!"
+        assert res_1["rule_name"] == "RULE_GTFOBINS_SUID_ABUSE", f"Sai luật: {res_1['rule_name']}"
+        assert res_1["threat_score"] >= 80, f"Threat score quá thấp: {res_1['threat_score']}"
 
-    # Kịch bản 3: Benign User Command (ls -la) - Không được kích hoạt cảnh báo sai
-    print("\n--- Test Case 3: Benign User Command (ls /home) - Kiểm tra False Positive ---")
-    event_3 = {
-        "event_type": 1,
-        "pid": 56000,
-        "tgid": 56000,
-        "ppid": 2040,
-        "uid": 1000,
-        "euid": 1000,
-        "cgroup_id": 0,
-        "mntns_id": 4026531840,
-        "comm": "ls",
-        "filename": "/usr/bin/ls",
-    }
-    raw_feat_3 = {
-        "exec_count": 1,
-        "uid_change_flag": 0,
-        "is_whitelisted_bin": 0,  # bình thường
-        "suspicious_path_flag": 0,
-        "service_parent_flag": 0,
-        "sensitive_file_access": 0,
-        "cap_check_count": 0,
-        "priv_syscall_rate": 0.33,
-    }
-    feat_vec_3 = np.array([1, 0, 0, 0, 0, 0, 0, 0.33], dtype=np.float32)
-    res_3 = detector.analyze(event_3, feat_vec_3, raw_feat_3)
+        # Kịch bản 2: Exploit từ thư mục /tmp đọc /etc/shadow
+        print("\n--- Test Case 2: Exploit Drop trong /tmp đọc trộm /etc/shadow ---")
+        event_2 = {
+            "event_type": 4,
+            "pid": 55112,
+            "tgid": 55110,
+            "ppid": 2040,
+            "uid": 1000,
+            "euid": 0,
+            "cgroup_id": 8192,
+            "mntns_id": 4026532200,
+            "comm": "exploit",
+            "filename": "/etc/shadow",
+        }
+        raw_feat_2 = {
+            "exec_count": 6,
+            "uid_change_flag": 1,
+            "is_whitelisted_bin": 0,  # unwhitelisted
+            "suspicious_path_flag": 1,
+            "service_parent_flag": 0,
+            "sensitive_file_access": 2,
+            "cap_check_count": 3,
+            "priv_syscall_rate": 5.0,
+        }
+        feat_vec_2 = np.array([6, 1, 0, 1, 0, 2, 3, 5.0], dtype=np.float32)
+        res_2 = detector.analyze(event_2, feat_vec_2, raw_feat_2)
 
-    assert res_3 is None, f"Assertion Error: Benign command bị cảnh báo sai (False Positive): {res_3}"
+        assert res_2 is not None, "Assertion Error: Case 2 không kích hoạt được cảnh báo!"
+        assert res_2["threat_score"] >= 80, f"Threat score quá thấp: {res_2['threat_score']}"
 
-    print("\n[✓] Kiểm thử Assertion thành công 100%! Các luật và ngưỡng điểm hoạt động hoàn toàn chính xác.")
+        # Kịch bản 3: Benign User Command (ls -la) - Không được kích hoạt cảnh báo sai
+        print("\n--- Test Case 3: Benign User Command (ls /home) - Kiểm tra False Positive ---")
+        event_3 = {
+            "event_type": 1,
+            "pid": 56000,
+            "tgid": 56000,
+            "ppid": 2040,
+            "uid": 1000,
+            "euid": 1000,
+            "cgroup_id": 0,
+            "mntns_id": 4026531840,
+            "comm": "ls",
+            "filename": "/usr/bin/ls",
+        }
+        raw_feat_3 = {
+            "exec_count": 1,
+            "uid_change_flag": 0,
+            "is_whitelisted_bin": 0,  # bình thường
+            "suspicious_path_flag": 0,
+            "service_parent_flag": 0,
+            "sensitive_file_access": 0,
+            "cap_check_count": 0,
+            "priv_syscall_rate": 0.33,
+        }
+        feat_vec_3 = np.array([1, 0, 0, 0, 0, 0, 0, 0.33], dtype=np.float32)
+        res_3 = detector.analyze(event_3, feat_vec_3, raw_feat_3)
+
+        assert res_3 is None, f"Assertion Error: Benign command bị cảnh báo sai (False Positive): {res_3}"
+
+        # Kiểm chứng file log JSONL
+        with open(tmp_log_path, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f if l.strip()]
+
+        assert len(lines) == 2, f"Assertion Error: Mong đợi 2 dòng log cảnh báo JSONL, nhưng tìm thấy {len(lines)}"
+        log_entry = json.loads(lines[0])
+        assert "timestamp" in log_entry, "Thiếu trường timestamp trong JSONL"
+        assert log_entry["threat_score"] >= 80, "Threat score trong log không khớp"
+        assert log_entry["comm"] == "find", "Comm trong log không khớp"
+
+        print("\n[✓] Kiểm thử Assertion thành công 100%! Các luật, ngưỡng điểm và AlertLogger JSONL hoạt động hoàn toàn chính xác.")
+    finally:
+        if os.path.exists(tmp_log_path):
+            os.remove(tmp_log_path)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Linux eBPF + ML Privilege Escalation Detector")
     parser.add_argument("--test-alert", action="store_true", help="Chạy kiểm thử logic cảnh báo giả lập bằng assertion mà không cần quyền root")
+    parser.add_argument("--alert-log", type=str, default="alerts.jsonl", help="Đường dẫn file ghi cảnh báo JSONL (mặc định: alerts.jsonl)")
+    parser.add_argument("--no-log", action="store_true", help="Vô hiệu hóa việc ghi log ra file")
     args = parser.parse_args()
 
     if args.test_alert:
         run_test_alert()
         return
 
-    # Khởi động Agent kết hợp eBPF Collector
-    detector = PrivEscDetector()
+    log_path = None if args.no_log else args.alert_log
+
+    # Khởi động Agent kết hợp eBPF Collector và AlertLogger
+    detector = PrivEscDetector(alert_log_path=log_path)
 
     from agent.collector import BPFCollector
     def on_event(event_dict, feature_vec, raw_features, extractor):
