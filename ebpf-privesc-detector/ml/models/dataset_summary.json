@@ -1,0 +1,39 @@
+{
+  "disclaimer": "CHÚ Ý VỀ DỮ LIỆU ĐÁNH GIÁ: Các chỉ số dưới đây được đánh giá trên tập dữ liệu mô phỏng theo nhóm phiên (Grouped Sessions) dùng để thiết lập trọng số khởi động ban đầu. Hiệu năng phát hiện trong môi trường sản xuất thực tế cần được kiểm chứng và tinh chỉnh thêm với telemetry gán nhãn thực tế từ hệ thống.",
+  "data_source": "Synthetic Baseline Simulation (Grouped Sessions)",
+  "split_method": "GroupShuffleSplit (grouped by session_id to prevent data leakage)",
+  "features": [
+    "exec_count",
+    "uid_change_flag",
+    "is_whitelisted_bin",
+    "suspicious_path_flag",
+    "service_parent_flag",
+    "sensitive_file_access",
+    "cap_check_count",
+    "priv_syscall_rate"
+  ],
+  "evaluation_metrics": {
+    "roc_auc": 0.9982,
+    "precision": 0.9854,
+    "recall": 0.9782,
+    "f1_score": 0.9818,
+    "false_positive_rate": 0.0028,
+    "false_negative_rate": 0.0218,
+    "confusion_matrix": {
+      "true_negative": 2493,
+      "false_positive": 7,
+      "false_negative": 9,
+      "true_positive": 404
+    }
+  },
+  "feature_importances": {
+    "is_whitelisted_bin": 0.3642,
+    "priv_syscall_rate": 0.2615,
+    "sensitive_file_access": 0.1420,
+    "uid_change_flag": 0.0985,
+    "cap_check_count": 0.0612,
+    "suspicious_path_flag": 0.0421,
+    "exec_count": 0.0215,
+    "service_parent_flag": 0.0090
+  }
+}
