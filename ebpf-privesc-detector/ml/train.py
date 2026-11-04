@@ -328,22 +328,20 @@ def main():
     parser.add_argument("--check-only", action="store_true", help="Chỉ kiểm tra tính hợp lệ của dữ liệu mà không ghi đè model")
     args = parser.parse_args()
 
+    from ml.telemetry_loader import TelemetryValidationError
+
     try:
         train_models(telemetry_file=args.telemetry_file, check_only=args.check_only)
     except FileNotFoundError as e:
         print(f"\n[!] LỖI TỆP TIN: {e}", file=sys.stderr)
         sys.exit(1)
+    except TelemetryValidationError as e:
+        print(f"\n[!] LỖI XÁC THỰC TELEMETRY (Dòng {e.line_number}, Trường '{e.field}'): {e.message}", file=sys.stderr)
+        sys.exit(1)
     except ValueError as e:
         print(f"\n[!] LỖI DỮ LIỆU HUẤN LUYỆN: {e}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        try:
-            from ml.telemetry_loader import TelemetryValidationError
-            if isinstance(e, TelemetryValidationError):
-                print(f"\n[!] LỖI XÁC THỰC TELEMETRY (Dòng {e.line_number}, Trường '{e.field}'): {e.message}", file=sys.stderr)
-                sys.exit(1)
-        except ImportError:
-            pass
         print(f"\n[!] LỖI TRONG QUÁ TRÌNH HUẤN LUYỆN: {e}", file=sys.stderr)
         sys.exit(1)
 

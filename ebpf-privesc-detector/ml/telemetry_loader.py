@@ -5,6 +5,7 @@ session_id và timestamp. Báo lỗi chi tiết kèm số dòng nếu dữ liệ
 """
 
 import os
+import sys
 import json
 from pathlib import Path
 from datetime import datetime
@@ -13,6 +14,9 @@ import pandas as pd
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from agent.features import FEATURE_NAMES, FeatureExtractor, get_event_timestamp
 
 SCHEMA_PATH = PROJECT_ROOT / "ml" / "data" / "telemetry_schema.json"
@@ -24,6 +28,8 @@ class TelemetryValidationError(ValueError):
         super().__init__(f"[Dòng {line_number}] Lỗi trường '{field_name}': {message}")
         self.line_number = line_number
         self.field_name = field_name
+        self.field = field_name
+        self.message = message
         self.raw_data = raw_data
 
 
@@ -67,11 +73,11 @@ class TelemetryLoader:
             raise TelemetryValidationError(line_no, "root", f"Bản ghi phải là đối tượng JSON/Dict, nhận được {type(record).__name__}")
 
         # Kiểm tra nếu người dùng nhầm lẫn truyền file cảnh báo (Alert log)
-        if "threat_score" in record or "matched_rules" in record:
+        if "threat_score" in record or "matched_rules" in record or "triggered_rule" in record:
             raise TelemetryValidationError(
                 line_no,
                 "format",
-                "File này có cấu trúc Alert Log (chứa 'threat_score' hoặc 'matched_rules'), không phải Telemetry có nhãn ground-truth. "
+                "File này có cấu trúc Alert Log (chứa 'threat_score', 'triggered_rule' hoặc 'matched_rules'), không phải Telemetry có nhãn ground-truth. "
                 "Alert log không thể dùng trực tiếp để huấn luyện mô hình. Vui lòng thu thập telemetry có gán nhãn theo ml/data/telemetry_schema.json.",
                 record
             )

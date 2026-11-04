@@ -4,16 +4,19 @@
   "description": "Schema chuẩn cho bản ghi telemetry sự kiện nhân Linux phục vụ huấn luyện và đánh giá mô hình phát hiện leo thang đặc quyền",
   "type": "object",
   "required": [
-    "timestamp_iso",
     "event_type",
     "tgid",
     "pid",
-    "ppid",
     "uid",
     "euid",
     "comm",
     "session_id",
     "label"
+  ],
+  "anyOf": [
+    { "required": ["timestamp_ns"] },
+    { "required": ["timestamp_iso"] },
+    { "required": ["timestamp"] }
   ],
   "properties": {
     "timestamp_iso": {
@@ -23,8 +26,13 @@
     },
     "timestamp_ns": {
       "type": "integer",
-      "minimum": 0,
+      "exclusiveMinimum": 0,
       "description": "Thời gian nanosecond lấy từ bpf_ktime_get_ns() của Linux kernel"
+    },
+    "timestamp": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Thời gian sự kiện theo giây UNIX epoch hoặc monotonic (float)"
     },
     "event_type": {
       "type": "integer",
