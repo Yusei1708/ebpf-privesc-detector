@@ -30,7 +30,10 @@ class TestAlertLogger(unittest.TestCase):
         self.assertEqual(mode & 0o777, 0o600)
 
     def test_log_alert_json_structure(self):
-        """Kiểm tra cấu trúc và các trường bắt buộc trong bản ghi JSONL"""
+        """Kiểm tra cấu trúc và các trường bắt buộc trong bản ghi JSONL (trong Container)"""
+        host_ns = self.logger.host_mntns_id or 4026531840
+        container_ns = host_ns + 250
+
         alert_data = {
             "event": {
                 "event_type": 1,
@@ -43,7 +46,7 @@ class TestAlertLogger(unittest.TestCase):
                 "comm": "find",
                 "filename": "/usr/bin/find",
                 "cgroup_id": 4096,
-                "mntns_id": 4026531840,
+                "mntns_id": container_ns,
             },
             "raw_features": {
                 "exec_count": 2,
@@ -86,6 +89,30 @@ class TestAlertLogger(unittest.TestCase):
         self.assertEqual(record["anomaly_score"], -0.12)
         self.assertEqual(record["triggered_rule"]["rule_id"], "PRIVESC-002")
         self.assertTrue(record["is_container"])
+
+    def test_host_process_not_marked_as_container(self):
+        """Tiến trình trên máy Host (cgroup_id != 0 nhưng mntns_id trùng Host) phải có is_container == False"""
+        host_ns = self.logger.host_mntns_id or 4026531840
+        logger = AlertLogger(self.log_path, host_mntns_id=host_ns)
+        alert_data = {
+            "event": {
+                "event_type": 1,
+                "pid": 2000,
+                "tgid": 2000,
+                "ppid": 1,
+                "uid": 1000,
+                "euid": 0,
+                "cgroup_id": 4096,
+                "mntns_id": host_ns,
+                "comm": "find",
+            },
+            "raw_features": {},
+            "threat_score": 95,
+        }
+        self.assertTrue(logger.log_alert(alert_data))
+        with open(self.log_path, "r", encoding="utf-8") as f:
+            record = json.loads(f.readline())
+        self.assertFalse(record["is_container"])
 
     def test_sanitize_string(self):
         """Khử bỏ null bytes và ký tự điều khiển lạ để tránh Log Injection"""

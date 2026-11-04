@@ -3,15 +3,21 @@ tests/test_features.py: Unit tests kiểm thử trích xuất 8 đặc trưng, s
 """
 
 import time
+import ctypes
 import unittest
 import numpy as np
 
+from agent.collector import CEvent
 from agent.features import FeatureExtractor, FEATURE_NAMES, WHITELISTED_SUID_BINS
 
 
 class TestFeatureExtractor(unittest.TestCase):
     def setUp(self):
         self.extractor = FeatureExtractor(window_size_seconds=3.0)
+
+    def test_cevent_abi_alignment_200_bytes(self):
+        """Đảm bảo struct CEvent Python khớp chính xác 200 bytes căn chỉnh 8-byte với probes.c"""
+        self.assertEqual(ctypes.sizeof(CEvent), 200)
 
     def test_feature_names_order(self):
         """Kiểm tra danh sách 8 đặc trưng chuẩn hóa"""
@@ -103,22 +109,24 @@ class TestFeatureExtractor(unittest.TestCase):
         self.assertEqual(f["cap_check_count"], 3)
 
     def test_reparenting_vs_pid_reuse(self):
-        """Phân biệt an toàn giữa reparenting (tiến trình cha chết) và tái sử dụng PID"""
+        """Phân biệt an toàn giữa reparenting/nghỉ ngắn hạn và tái sử dụng PID sau idle dài hạn (> 300s)"""
         tgid = 700
 
-        # Bước 1: Tiến trình khởi tạo bởi cha PPID 500
+        # Bước 1: Tiến trình khởi tạo bởi cha PPID 500 tại t=100.0
         self.extractor.update_process(pid=tgid, ppid=500, comm="worker", uid=1000, euid=1000, cgroup_id=0, mntns_id=0, event_time=100.0)
         self.extractor.add_event({"event_type": 1, "tgid": tgid, "comm": "worker", "timestamp": 100.0})
         self.assertEqual(len(self.extractor.event_windows[tgid]), 1)
 
-        # Bước 2: Tiến trình cha PPID 500 chết, Linux reparent tiến trình tgid sang PID 1 (init/systemd)
-        # Đây KHÔNG PHẢI là PID reuse, không được xóa event_windows hay đổi initial_uid!
+        # Bước 2: Tiến trình cha PPID 500 chết, Linux reparent sang PID 1 hoặc subreaper sau khoảng nghỉ ngắn (19s)
+        # KHÔNG ĐƯỢC coi là PID reuse hay xóa tùy tiện initial_uids / event_windows!
         self.extractor.update_process(pid=tgid, ppid=1, comm="worker", uid=1000, euid=1000, cgroup_id=0, mntns_id=0, event_time=101.0)
+        self.extractor.update_process(pid=tgid, ppid=999, comm="worker", uid=1000, euid=1000, cgroup_id=0, mntns_id=0, event_time=120.0)
         self.assertEqual(self.extractor.initial_uids[tgid], 1000)
         self.assertEqual(len(self.extractor.event_windows[tgid]), 1)
 
-        # Bước 3: Sau đó một tiến trình mới tái sử dụng PID 700 với UID khác (0) hoặc sau idle kéo dài
-        self.extractor.update_process(pid=tgid, ppid=999, comm="root_proc", uid=0, euid=0, cgroup_id=0, mntns_id=0, event_time=120.0)
+        # Bước 3: Sau khoảng lặng vượt ngưỡng max_idle_seconds (> 300s, t=450.0 > 120.0 + 300.0),
+        # hệ thống kiểm tra idle TRƯỚC KHI cập nhật last_seen và khởi tạo sạch trạng thái PID mới
+        self.extractor.update_process(pid=tgid, ppid=999, comm="root_proc", uid=0, euid=0, cgroup_id=0, mntns_id=0, event_time=450.0)
         self.assertEqual(self.extractor.initial_uids[tgid], 0)
         self.assertEqual(len(self.extractor.event_windows[tgid]), 0)
 
@@ -147,6 +155,14 @@ class TestFeatureExtractor(unittest.TestCase):
         self.assertNotIn(1000.5, remaining_ts)
         self.assertIn(1001.0, remaining_ts)
         self.assertIn(1004.0, remaining_ts)
+
+    def test_missing_timestamp_does_not_mix_epoch_with_monotonic_window(self):
+        """Bản ghi thiếu timestamp không được trộn time.time() làm mất cửa sổ monotonic"""
+        tgid = 850
+        self.extractor.add_event({"event_type": 1, "tgid": tgid, "timestamp_ns": 50_000_000_000})  # 50.0s monotonic
+        _, feat = self.extractor.extract_features(tgid, {"event_type": 4, "tgid": tgid, "filename": "/etc/shadow"})
+        self.assertEqual(feat["exec_count"], 1)
+        self.assertEqual(feat["sensitive_file_access"], 1)
 
     def test_corrupted_and_missing_data(self):
         """Kiểm tra khả năng chịu lỗi khi dữ liệu khuyết thiếu hoặc None"""

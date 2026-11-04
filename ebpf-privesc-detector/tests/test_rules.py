@@ -176,6 +176,48 @@ class TestDetectionRules(unittest.TestCase):
         self.assertFalse(hit)
         self.assertIsNone(match)
 
+    def test_benign_root_daemon_cap_checks_no_false_positive(self):
+        """Daemon chạy sẵn dưới quyền root (uid=0) kiểm tra CAP_SYS_ADMIN nhiều lần KHÔNG bị cảnh báo sai"""
+        event = {
+            "event_type": 3,
+            "uid": 0,
+            "euid": 0,
+            "comm": "systemd",
+            "cap": 21,
+        }
+        raw_feat = {
+            "uid_change_flag": 0,
+            "is_whitelisted_bin": 0,
+            "suspicious_path_flag": 0,
+            "service_parent_flag": 0,
+            "cap_check_count": 10,
+            "sensitive_file_access": 2,
+        }
+        hit, match = self.detector.evaluate_rules(event, raw_feat)
+        self.assertFalse(hit)
+        self.assertIsNone(match)
+
+    def test_unprivileged_cap_checks_only_no_alert(self):
+        """Chỉ gọi cap_capable lặp lại mà không có sự kiện/ngữ cảnh rủi ro liên quan KHÔNG phát cảnh báo kết luận"""
+        event = {
+            "event_type": 3,
+            "uid": 1000,
+            "euid": 1000,
+            "comm": "chromium",
+            "cap": 21,
+        }
+        raw_feat = {
+            "uid_change_flag": 0,
+            "is_whitelisted_bin": 0,
+            "suspicious_path_flag": 0,
+            "service_parent_flag": 0,
+            "cap_check_count": 8,
+            "sensitive_file_access": 0,
+        }
+        hit, match = self.detector.evaluate_rules(event, raw_feat)
+        self.assertFalse(hit)
+        self.assertIsNone(match)
+
     def test_benign_normal_user_command_no_false_positive(self):
         """Người dùng thông thường chạy lệnh không đặc quyền KHÔNG ĐƯỢC báo động"""
         event = {

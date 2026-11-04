@@ -134,24 +134,23 @@ class TestMLPipeline(unittest.TestCase):
 
     def test_validation_error_on_alert_log_passed_as_telemetry(self):
         """Từ chối rõ ràng và báo lỗi khi người dùng truyền nhầm file log cảnh báo thay vì telemetry có nhãn"""
-        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False, mode="w", encoding="utf-8") as f:
-            alert_rec = {
-                "timestamp": "2026-10-23T12:00:00Z",
-                "threat_score": 85,
-                "matched_rules": ["PRIVESC-001"],
-            }
-            f.write(json.dumps(alert_rec) + "\n")
-            tmp_path = f.name
+        for alert_rec in (
+            {"timestamp": "2026-10-23T12:00:00Z", "threat_score": 85, "matched_rules": ["PRIVESC-001"]},
+            {"timestamp": "2026-10-23T12:00:00Z", "triggered_rule": {"rule_id": "PRIVESC-002"}},
+        ):
+            with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False, mode="w", encoding="utf-8") as f:
+                f.write(json.dumps(alert_rec) + "\n")
+                tmp_path = f.name
 
-        try:
-            with self.assertRaises(TelemetryValidationError) as ctx:
-                self.loader.load_jsonl(tmp_path)
-            self.assertEqual(ctx.exception.line_number, 1)
-            self.assertEqual(ctx.exception.field, "format")
-            self.assertIn("Alert Log", ctx.exception.message)
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            try:
+                with self.assertRaises(TelemetryValidationError) as ctx:
+                    self.loader.load_jsonl(tmp_path)
+                self.assertEqual(ctx.exception.line_number, 1)
+                self.assertEqual(ctx.exception.field, "format")
+                self.assertIn("Alert Log", ctx.exception.message)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
     def test_validation_error_on_invalid_event_type(self):
         """Từ chối event_type không thuộc miền [1, 2, 3, 4]"""
