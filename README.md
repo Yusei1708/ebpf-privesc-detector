@@ -95,7 +95,7 @@ Trong mỗi cửa sổ trượt 3.0 giây (`Sliding Window 3.0s`), hệ thống 
 | **PRIVESC-003** | `RULE_SUSPICIOUS_PATH_PRIV_EXEC`| HIGH | T1059 | Thực thi mã từ `/tmp` hoặc `/dev/shm` với `EUID == 0` ngoài whitelist. |
 | **PRIVESC-004** | `RULE_SERVICE_SPAWNED_ROOT_SHELL`| CRITICAL | T1068 | Tiến trình con của web/network daemon nâng quyền lên root (dấu hiệu Web Shell RCE). |
 | **PRIVESC-005** | `RULE_SENSITIVE_FILE_ACCESS_ATTEMPT`| HIGH | T1003.008 | Yêu cầu mở `/etc/shadow` trong bối cảnh nghi vấn (`/tmp`, con của service, hoặc unwhitelisted root). |
-| **PRIVESC-006** | `RULE_PRIVILEGED_CAPABILITY_PROBE`| MEDIUM | T1548 | Tiến trình không đặc quyền yêu cầu kernel kiểm tra `CAP_SETUID`/`CAP_SYS_ADMIN` kèm tín hiệu rủi ro ngữ cảnh (đường dẫn `/tmp`, con của service, hoặc tần suất cao). |
+| **PRIVESC-006** | `RULE_PRIVILEGED_CAPABILITY_PROBE`| MEDIUM | T1548 | Tiến trình không đặc quyền (`uid != 0`) ngoài whitelist kích hoạt kiểm tra `CAP_SETUID`/`CAP_SYS_ADMIN` kèm ngữ cảnh rủi ro tương quan (`/tmp`, con của service, nhảy quyền, hoặc lặp kiểm tra kèm truy cập file nhạy cảm). |
 
 ---
 
@@ -111,10 +111,11 @@ Trong mỗi cửa sổ trượt 3.0 giây (`Sliding Window 3.0s`), hệ thống 
 
 ### 5.2. Khởi Tạo Môi Trường Ảo Python
 ```bash
-# Tạo virtualenv kế thừa python-bcc từ hệ thống
+# Tạo virtualenv bên trong thư mục dự án, kế thừa python-bcc từ hệ thống
+cd ebpf-privesc-detector
 python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
-pip install -r ebpf-privesc-detector/requirements.txt
+pip install -r requirements.txt
 ```
 
 ---
@@ -168,7 +169,7 @@ Dự án cung cấp bộ công cụ đo lường định lượng và hướng d
 Lệnh thực hiện:
 ```bash
 # Đo Agent eBPF trong 30 giây
-python ebpf-privesc-detector/benchmarks/benchmark_agent_vs_auditd.py --pid $(pgrep -f "agent/detector.py") --label "eBPF-Agent" --duration 30
+python ebpf-privesc-detector/benchmarks/benchmark_agent_vs_auditd.py --pid $(pgrep -f "main.py" | head -n 1) --label "eBPF-Agent" --duration 30
 
 # Đo daemon auditd trong 30 giây
 python ebpf-privesc-detector/benchmarks/benchmark_agent_vs_auditd.py --pid $(pgrep -x auditd) --label "Auditd" --duration 30

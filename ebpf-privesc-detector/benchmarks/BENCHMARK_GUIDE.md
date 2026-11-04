@@ -61,8 +61,8 @@ Sử dụng script đo kiểm [`benchmarks/benchmark_agent_vs_auditd.py`](benchm
 
 ### Bước 1: Đo eBPF Agent
 ```bash
-# Lấy PID của tiến trình python detector
-AGENT_PID=$(pgrep -f "agent/detector.py" | head -n 1)
+# Lấy PID của tiến trình python detector (khởi chạy qua main.py)
+AGENT_PID=$(pgrep -f "main.py" | head -n 1)
 
 # Chạy benchmark trong 30 giây lấy mẫu mỗi 0.5s
 python benchmarks/benchmark_agent_vs_auditd.py \

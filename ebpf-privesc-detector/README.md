@@ -95,7 +95,7 @@ Trong mỗi cửa sổ trượt 3.0 giây (`Sliding Window 3.0s`), hệ thống 
 | **PRIVESC-003** | `RULE_SUSPICIOUS_PATH_PRIV_EXEC`| HIGH | T1059 | Thực thi mã từ `/tmp` hoặc `/dev/shm` với `EUID == 0` ngoài whitelist. |
 | **PRIVESC-004** | `RULE_SERVICE_SPAWNED_ROOT_SHELL`| CRITICAL | T1068 | Tiến trình con của web/network daemon nâng quyền lên root (dấu hiệu Web Shell RCE). |
 | **PRIVESC-005** | `RULE_SENSITIVE_FILE_ACCESS_ATTEMPT`| HIGH | T1003.008 | Yêu cầu mở `/etc/shadow` trong bối cảnh nghi vấn (`/tmp`, con của service, hoặc unwhitelisted root). |
-| **PRIVESC-006** | `RULE_PRIVILEGED_CAPABILITY_PROBE`| MEDIUM | T1548 | Tiến trình không đặc quyền yêu cầu kernel kiểm tra `CAP_SETUID`/`CAP_SYS_ADMIN` kèm tín hiệu rủi ro ngữ cảnh (đường dẫn `/tmp`, con của service, hoặc tần suất cao). |
+| **PRIVESC-006** | `RULE_PRIVILEGED_CAPABILITY_PROBE`| MEDIUM | T1548 | Tiến trình không đặc quyền (`uid != 0`) ngoài whitelist kích hoạt kiểm tra `CAP_SETUID`/`CAP_SYS_ADMIN` kèm ngữ cảnh rủi ro tương quan (`/tmp`, con của service, nhảy quyền, hoặc lặp kiểm tra kèm truy cập file nhạy cảm). |
 
 ---
 
@@ -163,7 +163,7 @@ Dự án cung cấp bộ công cụ đo lường định lượng và hướng d
 Lệnh thực hiện:
 ```bash
 # Đo Agent eBPF trong 30 giây
-python benchmarks/benchmark_agent_vs_auditd.py --pid $(pgrep -f "agent/detector.py") --label "eBPF-Agent" --duration 30
+python benchmarks/benchmark_agent_vs_auditd.py --pid $(pgrep -f "main.py" | head -n 1) --label "eBPF-Agent" --duration 30
 
 # Đo daemon auditd trong 30 giây
 python benchmarks/benchmark_agent_vs_auditd.py --pid $(pgrep -x auditd) --label "Auditd" --duration 30

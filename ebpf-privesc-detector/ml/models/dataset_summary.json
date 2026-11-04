@@ -1,7 +1,10 @@
 {
-  "disclaimer": "CHÚ Ý VỀ DỮ LIỆU ĐÁNH GIÁ: Các chỉ số dưới đây được đánh giá trên tập dữ liệu mô phỏng theo nhóm phiên (Grouped Sessions) dùng để thiết lập trọng số khởi động ban đầu. Hiệu năng phát hiện trong môi trường sản xuất thực tế cần được kiểm chứng và tinh chỉnh thêm với telemetry gán nhãn thực tế từ hệ thống.",
+  "disclaimer": "CHÚ Ý VỀ DỮ LIỆU ĐÁNH GIÁ: Các chỉ số dưới đây được đánh giá trên tập dữ liệu mô phỏng hoặc telemetry ban đầu dùng để thiết lập trọng số khởi động (cold-start). Hiệu năng phát hiện trong môi trường sản xuất thực tế phụ thuộc vào việc nạp và tinh chỉnh thêm với telemetry có nhãn từ hệ thống mục tiêu.",
   "data_source": "Synthetic Baseline Simulation (Grouped Sessions)",
   "split_method": "GroupShuffleSplit (grouped by session_id to prevent data leakage)",
+  "n_samples": 11652,
+  "n_train": 8739,
+  "n_test": 2913,
   "features": [
     "exec_count",
     "uid_change_flag",
