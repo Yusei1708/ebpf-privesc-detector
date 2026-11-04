@@ -88,17 +88,17 @@ def is_suspicious_path(path: str) -> bool:
     return False
 
 
-def get_event_timestamp(event: Dict[str, Any], fallback_time: Optional[float] = None) -> float:
+def extract_explicit_timestamp(event: Optional[Dict[str, Any]]) -> Optional[float]:
     """
-    Trích xuất timestamp thực tế của sự kiện theo đơn vị giây (float).
+    Trích xuất timestamp tường minh từ bản ghi sự kiện theo đơn vị giây (float).
+    Trả về None nếu sự kiện không chứa bất kỳ trường thời gian hợp lệ nào.
     Ưu tiên:
       1. timestamp_ns (nanoseconds từ kernel bpf_ktime_get_ns())
-      2. timestamp_iso (chuẩn ISO-8601 UTC)
-      3. timestamp (số giây UNIX epoch)
-      4. fallback_time hoặc time.time() nếu dữ liệu thiếu
+      2. timestamp (số giây float)
+      3. timestamp_iso (chuẩn ISO-8601 UTC)
     """
     if not event or not isinstance(event, dict):
-        return fallback_time if fallback_time is not None else time.time()
+        return None
 
     # 1. timestamp_ns từ nhân Linux
     ts_ns = event.get("timestamp_ns")
@@ -110,7 +110,7 @@ def get_event_timestamp(event: Dict[str, Any], fallback_time: Optional[float] = 
         except (ValueError, TypeError):
             pass
 
-    # 2. timestamp (epoch seconds)
+    # 2. timestamp (seconds)
     ts_sec = event.get("timestamp")
     if ts_sec is not None:
         try:
@@ -129,6 +129,17 @@ def get_event_timestamp(event: Dict[str, Any], fallback_time: Optional[float] = 
         except Exception:
             pass
 
+    return None
+
+
+def get_event_timestamp(event: Dict[str, Any], fallback_time: Optional[float] = None) -> float:
+    """
+    Trích xuất timestamp thực tế của sự kiện theo đơn vị giây (float),
+    sử dụng fallback_time hoặc time.time() nếu bản ghi thiếu trường thời gian.
+    """
+    explicit_ts = extract_explicit_timestamp(event)
+    if explicit_ts is not None:
+        return explicit_ts
     return fallback_time if fallback_time is not None else time.time()
 
 
@@ -153,8 +164,10 @@ class FeatureExtractor:
     timestamp thực tế của sự kiện.
     Hỗ trợ cả trực tiếp (live eBPF) lẫn phát lại ngoại tuyến (offline telemetry replay).
     """
-    def __init__(self, window_size_seconds: float = 3.0):
+    def __init__(self, window_size_seconds: float = 3.0, max_idle_seconds: float = 300.0):
         self.window_size = float(window_size_seconds)
+        self.max_idle_seconds = float(max_idle_seconds)
+        self.latest_event_time: Optional[float] = None
         # Lưu sự kiện theo tgid: tgid -> list[(event_timestamp_float, event_dict)] (luôn duy trì sắp xếp)
         self.event_windows: Dict[int, List[Tuple[float, Dict[str, Any]]]] = defaultdict(list)
         # Bảng theo dõi cây phả hệ tiến trình: pid -> ProcessNode
@@ -162,25 +175,54 @@ class FeatureExtractor:
         # Theo dõi UID ban đầu khi tiến trình bắt đầu xuất hiện
         self.initial_uids: Dict[int, int] = {}
 
+    def _resolve_timestamp(self, tgid: int, explicit_ts: Optional[float]) -> float:
+        """
+        Chọn mốc thời gian đồng nhất cùng miền đồng hồ (monotonic hoặc epoch)
+        khi sự kiện thử nghiệm không cung cấp trường timestamp tường minh.
+        """
+        if explicit_ts is not None:
+            self.latest_event_time = (
+                max(self.latest_event_time, explicit_ts)
+                if self.latest_event_time is not None
+                else explicit_ts
+            )
+            return explicit_ts
+        if self.event_windows.get(tgid):
+            return self.event_windows[tgid][-1][0]
+        if tgid in self.process_tree:
+            return self.process_tree[tgid].last_seen
+        if self.latest_event_time is not None:
+            return self.latest_event_time
+        return time.time()
+
     def update_process(self, pid: int, ppid: int, comm: str, uid: int, euid: int, cgroup_id: int, mntns_id: int, event_time: Optional[float] = None):
         """
         Cập nhật trạng thái tiến trình một cách an toàn.
         Lưu ý kỹ thuật về Vòng đời & Tái sử dụng PID (PID Reuse):
-        - Không xóa trạng thái chỉ vì tiến trình tạm dừng (idle).
+        - Không xóa trạng thái chỉ vì tiến trình tạm dừng ngắn hạn (vài giây).
         - Không coi việc thay đổi PPID đơn thuần là PID reuse, vì trong Linux khi tiến trình cha chết,
           tiến trình con sẽ tự động được gán lại (reparent) sang init (PID 1) hoặc systemd/subreaper.
-        - Giữ nguyên trạng thái để không làm mất bằng chứng chuỗi tấn công (lineage).
+        - Kiểm tra ngưỡng không hoạt động dài hạn (max_idle_seconds) TRƯỚC KHI cập nhật last_seen
+          để làm mới an toàn khi PID cũ đã ngưng hoạt động quá lâu.
         """
-        ts = event_time if event_time is not None else time.time()
+        ts = self._resolve_timestamp(pid, event_time)
 
         if pid in self.process_tree:
             node = self.process_tree[pid]
-            # Cập nhật thông tin và ghi nhận thời gian thấy mới nhất
-            node.ppid = ppid
-            node.comm = comm
-            node.uid = uid
-            node.euid = euid
-            node.last_seen = max(node.last_seen, ts)
+            if (ts - node.last_seen) > self.max_idle_seconds:
+                # Tiến trình cũ đã ngưng hoạt động vượt ngưỡng an toàn -> khởi tạo mới trạng thái PID
+                self.event_windows.pop(pid, None)
+                self.process_tree[pid] = ProcessNode(pid, ppid, comm, uid, euid, cgroup_id, mntns_id, start_time=ts)
+                self.initial_uids[pid] = uid
+            else:
+                # Cập nhật thông tin và ghi nhận thời gian thấy mới nhất (bảo toàn initial_uids & lineage)
+                node.ppid = ppid
+                node.comm = comm
+                node.uid = uid
+                node.euid = euid
+                node.cgroup_id = cgroup_id
+                node.mntns_id = mntns_id
+                node.last_seen = max(node.last_seen, ts)
         else:
             self.process_tree[pid] = ProcessNode(pid, ppid, comm, uid, euid, cgroup_id, mntns_id, start_time=ts)
             self.initial_uids[pid] = uid
@@ -191,10 +233,10 @@ class FeatureExtractor:
         Tự động xử lý sự kiện đến muộn hoặc xáo trộn thứ tự thời gian.
         """
         tgid = event.get("tgid", 0)
-        ev_ts = get_event_timestamp(event)
+        ev_ts = self._resolve_timestamp(tgid, extract_explicit_timestamp(event))
 
-        # Cập nhật hoặc tạo tiến trình tương ứng
-        if tgid not in self.process_tree:
+        # Cập nhật hoặc tạo tiến trình tương ứng (kiểm tra idle TRƯỚC KHI cập nhật last_seen)
+        if tgid not in self.process_tree or (ev_ts - self.process_tree[tgid].last_seen) > self.max_idle_seconds:
             self.update_process(
                 pid=tgid,
                 ppid=event.get("ppid", 0),
@@ -218,15 +260,19 @@ class FeatureExtractor:
             idx = bisect.bisect_right(timestamps, ev_ts)
             window.insert(idx, (ev_ts, event))
 
-        self._prune_window(tgid, ev_ts)
+        self._prune_window(tgid, window[-1][0])
 
-    def _prune_window(self, tgid: int, current_event_time: float):
-        """Loại bỏ các sự kiện có timestamp cũ hơn current_event_time - window_size"""
+    def _prune_window(self, tgid: int, current_event_time: Optional[float] = None, current_time: Optional[float] = None):
+        """Loại bỏ các sự kiện có timestamp cũ hơn mốc hiện tại trừ đi window_size"""
+        ref_time = current_event_time if current_event_time is not None else current_time
+        if ref_time is None:
+            return
+
         window = self.event_windows.get(tgid)
         if not window:
             return
 
-        cutoff = current_event_time - self.window_size
+        cutoff = float(ref_time) - self.window_size
         # Tìm vị trí sự kiện đầu tiên thỏa mãn >= cutoff
         while window and window[0][0] < cutoff:
             window.pop(0)
@@ -234,15 +280,22 @@ class FeatureExtractor:
         if not window and tgid in self.event_windows:
             del self.event_windows[tgid]
 
-    def cleanup_old_processes(self, max_idle_seconds: float = 300.0, reference_time: Optional[float] = None):
+    def cleanup_old_processes(self, max_idle_seconds: Optional[float] = None, reference_time: Optional[float] = None):
         """
         Dọn dẹp các tiến trình đã kết thúc hoặc không còn hoạt động sau một khoảng thời gian dài an toàn (5 phút).
         Không xóa tùy tiện trong các khoảng thời gian ngắn để tránh mất dấu vết phả hệ.
         """
-        ref_ts = reference_time if reference_time is not None else time.time()
+        idle_limit = self.max_idle_seconds if max_idle_seconds is None else float(max_idle_seconds)
+        if reference_time is not None:
+            ref_ts = float(reference_time)
+        elif self.latest_event_time is not None:
+            ref_ts = self.latest_event_time
+        else:
+            ref_ts = time.time()
+
         dead_pids = [
             pid for pid, node in self.process_tree.items()
-            if (ref_ts - node.last_seen) > max_idle_seconds
+            if (ref_ts - node.last_seen) > idle_limit
         ]
         for pid in dead_pids:
             self.process_tree.pop(pid, None)
@@ -276,13 +329,9 @@ class FeatureExtractor:
         7. cap_check_count: Số lần kiểm tra CAP_SETUID, CAP_SYS_ADMIN, etc.
         8. priv_syscall_rate: Tần suất gọi sự kiện nhạy cảm trên giây trong window
         """
-        # Xác định mốc thời gian chuẩn từ sự kiện hiện tại hoặc sự kiện mới nhất trong cửa sổ
-        cur_ts = get_event_timestamp(current_event) if current_event else None
-        if cur_ts is None:
-            if self.event_windows.get(tgid):
-                cur_ts = self.event_windows[tgid][-1][0]
-            else:
-                cur_ts = time.time()
+        # Xác định mốc thời gian chuẩn từ sự kiện hiện tại hoặc sự kiện mới nhất trong cửa sổ (cùng miền đồng hồ)
+        explicit_cur_ts = extract_explicit_timestamp(current_event)
+        cur_ts = self._resolve_timestamp(tgid, explicit_cur_ts)
 
         self._prune_window(tgid, cur_ts)
         window_entries = self.event_windows.get(tgid, [])
@@ -361,7 +410,7 @@ class FeatureExtractor:
             priv_syscall_rate = float(priv_events_count) / self.window_size
         else:
             first_ts = window_entries[0][0] if window_entries else (cur_ts - 1.0)
-            last_ts = window_entries[-1][0] if window_entries else cur_ts
+            last_ts = max(window_entries[-1][0], cur_ts) if window_entries else cur_ts
             duration = max(last_ts - first_ts, 0.1)
             duration = min(duration, self.window_size)
             priv_syscall_rate = float(priv_events_count) / duration

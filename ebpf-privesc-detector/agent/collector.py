@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent.features import FeatureExtractor
+from agent.features import FeatureExtractor, get_event_timestamp
 
 # C struct tương ứng với struct event_t trong ebpf/probes.c
 # Khớp chính xác 200 bytes căn chỉnh 8-byte
@@ -95,7 +95,9 @@ class BPFCollector:
             "filename": event.filename.decode("utf-8", "replace"),
         }
 
-        # Cập nhật thông tin tiến trình và cây phả hệ
+        ev_ts = get_event_timestamp(event_dict, fallback_time=time.monotonic())
+
+        # Cập nhật thông tin tiến trình và cây phả hệ cùng miền thời gian monotonic với kernel
         self.extractor.update_process(
             pid=event_dict["tgid"],
             ppid=event_dict["ppid"],
@@ -104,6 +106,7 @@ class BPFCollector:
             euid=event_dict["euid"],
             cgroup_id=event_dict["cgroup_id"],
             mntns_id=event_dict["mntns_id"],
+            event_time=ev_ts,
         )
 
         # Thêm sự kiện vào Sliding Window
@@ -157,7 +160,7 @@ class BPFCollector:
         try:
             while self.running and self.bpf is not None:
                 self.bpf.perf_buffer_poll(timeout=100)
-                self.extractor.cleanup_old_processes()
+                self.extractor.cleanup_old_processes(reference_time=time.monotonic())
         except KeyboardInterrupt:
             pass
         finally:
