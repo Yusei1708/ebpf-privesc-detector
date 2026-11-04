@@ -30,12 +30,51 @@ def sanitize_string(val: Any) -> str:
     return s[:256]
 
 
+def get_host_mntns_id() -> Optional[int]:
+    """
+    Lấy inode number của Mount Namespace gốc trên máy Host.
+    Ưu tiên đọc /proc/1/ns/mnt (khi chạy với quyền root), fallback sang /proc/self/ns/mnt
+    (khi chạy kiểm thử user-space không đặc quyền trên máy Host).
+    """
+    for ns_path in ("/proc/1/ns/mnt", "/proc/self/ns/mnt"):
+        try:
+            ino = os.stat(ns_path).st_ino
+            if ino > 0:
+                return int(ino)
+        except OSError:
+            continue
+    return None
+
+
+def is_container_event(event: Dict[str, Any], host_mntns_id: Optional[int] = None) -> bool:
+    """
+    Xác định sự kiện phát sinh từ Container hoặc Mount Namespace cô lập.
+    So sánh mntns_id của sự kiện với mntns_id gốc của máy Host thay vì chỉ kiểm tra != 0
+    (do mọi tiến trình trên Host Linux đều có cgroup_id != 0 và mntns_id != 0).
+    """
+    if not isinstance(event, dict):
+        return False
+    if "is_container" in event and isinstance(event["is_container"], bool):
+        return event["is_container"]
+
+    mntns_id = int(event.get("mntns_id", 0) or 0)
+    if mntns_id <= 0:
+        return False
+
+    ref_host_mntns = host_mntns_id if host_mntns_id is not None else get_host_mntns_id()
+    if ref_host_mntns is not None and ref_host_mntns > 0:
+        return mntns_id != ref_host_mntns
+
+    return False
+
+
 class AlertLogger:
     """
     Quản lý ghi log cảnh báo JSONL an toàn
     """
-    def __init__(self, log_path: Optional[str] = None):
+    def __init__(self, log_path: Optional[str] = None, host_mntns_id: Optional[int] = None):
         self.log_path = Path(log_path) if log_path else Path("alerts.jsonl")
+        self.host_mntns_id = host_mntns_id if host_mntns_id is not None else get_host_mntns_id()
         self._ensure_secure_file()
 
     def _ensure_secure_file(self):
@@ -62,7 +101,7 @@ class AlertLogger:
         raw_feat = alert_data.get("raw_features", {})
         match = alert_data.get("match")
 
-        is_container = bool(event.get("cgroup_id", 0) != 0 and event.get("mntns_id", 0) != 0)
+        is_container = is_container_event(event, self.host_mntns_id)
         e_type = event.get("event_type", 0)
 
         record = {

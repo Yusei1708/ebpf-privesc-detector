@@ -28,7 +28,7 @@ from agent.features import (
     FeatureExtractor,
     is_suspicious_path,
 )
-from agent.alert_logger import AlertLogger
+from agent.alert_logger import AlertLogger, get_host_mntns_id, is_container_event
 
 # Sử dụng Rich để in giao diện cảnh báo đẹp mắt trên Terminal
 try:
@@ -61,7 +61,8 @@ class PrivEscDetector:
         self.scaler = None
         self.rf_model = None
         self.iso_model = None
-        self.logger = AlertLogger(alert_log_path) if alert_log_path else None
+        self.host_mntns_id = get_host_mntns_id()
+        self.logger = AlertLogger(alert_log_path, host_mntns_id=self.host_mntns_id) if alert_log_path else None
         self._load_models()
 
     def _load_models(self):
@@ -166,18 +167,27 @@ class PrivEscDetector:
         # LƯU Ý QUAN TRỌNG VỀ OBSERVABILITY:
         # Sự kiện kprobe cap_capable chỉ quan sát việc kernel thực hiện kiểm tra quyền (audit check),
         # KHÔNG khẳng định quyền đó được chấp thuận (allow) hay bị từ chối (deny/EPERM).
-        # Nhiều ứng dụng người dùng thông thường cũng có thể kích hoạt kiểm tra này trong glibc.
-        # Để tránh cảnh báo sai, chỉ phát tín hiệu khi có thêm bối cảnh bất thường:
-        # thực thi từ thư mục tạm, tiến trình con của web service, hoặc đi kèm nhảy quyền EUID.
+        # Nhiều ứng dụng người dùng thông thường và daemon root hợp lệ cũng kích hoạt kiểm tra này.
+        # Để tránh cảnh báo sai, chỉ phát tín hiệu đối với tiến trình không đặc quyền (uid != 0)
+        # ngoài whitelist và BẮT BUỘC đi kèm ngữ cảnh/sự kiện rủi ro tương quan.
         if e_type == 3 and event.get("cap") in (10, 21):  # CAP_SETUID (10), CAP_SYS_ADMIN (21)
-            if is_whitelisted == 0 and (suspicious_path == 1 or service_parent == 1 or uid_change == 1 or raw_features.get("cap_check_count", 0) >= 5):
+            correlated_cap_probe = (
+                raw_features.get("cap_check_count", 0) >= 5
+                and raw_features.get("sensitive_file_access", 0) >= 1
+            )
+            if uid != 0 and is_whitelisted == 0 and (
+                suspicious_path == 1
+                or service_parent == 1
+                or uid_change == 1
+                or correlated_cap_probe
+            ):
                 return True, RuleMatch(
                     rule_id="PRIVESC-006",
                     name="RULE_PRIVILEGED_CAPABILITY_PROBE",
                     severity="MEDIUM",
                     mitre_id="T1548",
-                    description=f"Tiến trình nghi vấn ({comm}) kiểm tra capability đặc quyền (CAP={event.get('cap')}) trong bối cảnh rủi ro",
-                    rationale="Quan sát thấy kiểm tra capability nhạy cảm kết hợp với thư mục tạm hoặc phả hệ service. Lưu ý probe chỉ ghi nhận kiểm tra tại entry, không xác nhận quyền đã được cấp.",
+                    description=f"Tiến trình không đặc quyền ({comm}) kiểm tra capability đặc quyền (CAP={event.get('cap')}) trong bối cảnh rủi ro",
+                    rationale="Quan sát thấy kiểm tra capability nhạy cảm kết hợp với thư mục tạm, phả hệ service, nhảy quyền hoặc truy cập file nhạy cảm. Lưu ý probe chỉ ghi nhận kiểm tra tại entry, không xác nhận quyền đã được cấp.",
                 )
 
         return False, None
@@ -256,7 +266,7 @@ class PrivEscDetector:
                       iso_score: float, threat_score: int,
                       extractor: Optional[FeatureExtractor] = None):
         """Hiển thị bảng cảnh báo chi tiết theo phong cách SOC Dashboard"""
-        is_container = (event.get("cgroup_id", 0) != 0 and event.get("mntns_id", 0) != 0)
+        is_container = is_container_event(event, self.host_mntns_id)
         source_env = "CONTAINER / ISOLATED NS" if is_container else "HOST SYSTEM"
 
         sev_color = "bold red on black" if threat_score >= 80 else "bold yellow on black"
@@ -311,8 +321,10 @@ def run_test_alert():
 
     try:
         detector = PrivEscDetector(alert_log_path=tmp_log_path)
+        host_ns = detector.host_mntns_id or 4026531840
+        container_ns = host_ns + 200
 
-        # Kịch bản 1: SUID Abuse (find gán SUID gọi /bin/sh)
+        # Kịch bản 1: SUID Abuse trên Host (find gán SUID gọi /bin/sh)
         print("\n--- Test Case 1: SUID Abuse (/usr/bin/find spawning shell with EUID=0) ---")
         event_1 = {
             "event_type": 1,
@@ -322,7 +334,7 @@ def run_test_alert():
             "uid": 1000,
             "euid": 0,
             "cgroup_id": 4096,
-            "mntns_id": 4026531840,
+            "mntns_id": host_ns,
             "comm": "find",
             "filename": "/usr/bin/find",
         }
@@ -343,8 +355,8 @@ def run_test_alert():
         assert res_1["rule_name"] == "RULE_GTFOBINS_SUID_ABUSE", f"Sai luật: {res_1['rule_name']}"
         assert res_1["threat_score"] >= 80, f"Threat score quá thấp: {res_1['threat_score']}"
 
-        # Kịch bản 2: Exploit từ thư mục /tmp đọc /etc/shadow
-        print("\n--- Test Case 2: Exploit Drop trong /tmp đọc trộm /etc/shadow ---")
+        # Kịch bản 2: Exploit trong Container (/tmp đọc /etc/shadow)
+        print("\n--- Test Case 2: Exploit Drop trong Container (/tmp đọc trộm /etc/shadow) ---")
         event_2 = {
             "event_type": 4,
             "pid": 55112,
@@ -353,7 +365,7 @@ def run_test_alert():
             "uid": 1000,
             "euid": 0,
             "cgroup_id": 8192,
-            "mntns_id": 4026532200,
+            "mntns_id": container_ns,
             "comm": "exploit",
             "filename": "/etc/shadow",
         }
@@ -382,8 +394,8 @@ def run_test_alert():
             "ppid": 2040,
             "uid": 1000,
             "euid": 1000,
-            "cgroup_id": 0,
-            "mntns_id": 4026531840,
+            "cgroup_id": 4096,
+            "mntns_id": host_ns,
             "comm": "ls",
             "filename": "/usr/bin/ls",
         }
@@ -407,10 +419,13 @@ def run_test_alert():
             lines = [l.strip() for l in f if l.strip()]
 
         assert len(lines) == 2, f"Assertion Error: Mong đợi 2 dòng log cảnh báo JSONL, nhưng tìm thấy {len(lines)}"
-        log_entry = json.loads(lines[0])
-        assert "timestamp" in log_entry, "Thiếu trường timestamp trong JSONL"
-        assert log_entry["threat_score"] >= 80, "Threat score trong log không khớp"
-        assert log_entry["comm"] == "find", "Comm trong log không khớp"
+        log_entry_1 = json.loads(lines[0])
+        log_entry_2 = json.loads(lines[1])
+        assert "timestamp" in log_entry_1, "Thiếu trường timestamp trong JSONL"
+        assert log_entry_1["threat_score"] >= 80, "Threat score trong log không khớp"
+        assert log_entry_1["comm"] == "find", "Comm trong log không khớp"
+        assert log_entry_1["is_container"] is False, "Tiến trình Host bị nhận diện nhầm là Container"
+        assert log_entry_2["is_container"] is True, "Tiến trình Container không được nhận diện đúng"
 
         print("\n[✓] Kiểm thử Assertion thành công 100%! Các luật, ngưỡng điểm và AlertLogger JSONL hoạt động hoàn toàn chính xác.")
     finally:
