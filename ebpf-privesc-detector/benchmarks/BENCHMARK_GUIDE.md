@@ -95,13 +95,12 @@ Sau khi hoàn thành các bài đo trên máy của bạn, điền kết quả v
 
 | Tiêu Chí Đo Lường | Linux `auditd` | eBPF PrivEsc Detector | Phương Pháp Đo Đạc & Ghi Chú |
 | :--- | :--- | :--- | :--- |
-| **CPU Trung bình (%)** | *[Điền kết quả]* | *[Điền kết quả]* | Tự động đo qua `benchmark_agent_vs_auditd.py` |
-| **CPU Đỉnh (%)** | *[Điền kết quả]* | *[Điền kết quả]* | Tự động đo qua `benchmark_agent_vs_auditd.py` |
-| **RAM (RSS MB)** | *[Điền kết quả]* | *[Điền kết quả]* | Tự động đo qua `benchmark_agent_vs_auditd.py` |
-| **Số sự kiện xử lý (Events/s)**| *[Điền kết quả]* | *[Điền kết quả]* | Đếm số dòng log sinh ra / thời gian đo |
-| **Tỷ lệ rớt sự kiện (Drop Rate %)**| *[Điền kết quả]* | *[Điền kết quả]* | `auditctl -s` (lost) vs BPF perf buffer drops |
+| **CPU Trung bình / P95 / Đỉnh (%)** | *[Điền kết quả]* | *[Điền kết quả]* | Tự động đo bằng `time.monotonic()` & parse `/proc/<pid>/stat` (an toàn cả khi `comm` chứa khoảng trắng) qua `benchmark_agent_vs_auditd.py` |
+| **RAM RSS Trung bình / P95 / Đỉnh (MB)** | *[Điền kết quả]* | *[Điền kết quả]* | Tự động đo `VmRSS` qua `/proc/<pid>/status` trong `benchmark_agent_vs_auditd.py` |
+| **Số sự kiện xử lý (Events/s)**| *[Điền kết quả]* | *[Điền kết quả]* | Đếm số dòng log / `processed` in ra khi `BPFCollector.cleanup()` |
+| **Tỷ lệ rớt sự kiện (Drop Rate %)**| *[Điền kết quả]* | *[Điền kết quả]* | `auditctl -s` (`lost`) vs `lost_cb` BPF Perf Buffer (`64` pages) in lúc cleanup |
 | **Độ trễ phát hiện (Latency)**| *[Điền kết quả]* | *[Điền kết quả]* | Chênh lệch giữa timestamp syscall và timestamp alert |
-| **Tác động đến I/O máy chủ** | Ghi log đĩa liên tục | Xử lý in-memory, chỉ log khi có alert | Quan sát qua `iotop` hoặc `vmstat` |
+| **Tác động đến I/O máy chủ** | Ghi log đĩa liên tục | Xử lý in-memory, chỉ log khi có alert (kèm `--cooldown`) | Quan sát qua `iotop` hoặc `vmstat` |
 
 ---
 

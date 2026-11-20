@@ -17,38 +17,38 @@ Repository: [https://github.com/Yusei1708/ebpf-privesc-detector](https://github.
 +-------------------------------------------------------------------------------------------------+
 |                                        LINUX KERNEL SPACE                                       |
 |                                                                                                 |
-|   [tracepoint:sys_enter_execve]      [kprobe:commit_creds]       [kprobe:cap_capable]            |
-|       (Quan sát thực thi)         (Quan sát đổi quyền task)     (Quan sát kiểm tra Cap)         |
+|   [tp:sys_enter_execve / execveat]   [kprobe:commit_creds]       [kprobe:cap_capable]           |
+|     (Quan sát thực thi / memfd)    (Quan sát đổi quyền task)   (CAP_SETUID=7, SYS_ADMIN=21)     |
 |               |                              |                            |                     |
 |               +------------------------------+----------------------------+                     |
 |                                              |                                                  |
-|                                [tracepoint:sys_enter_openat]                                    |
-|                                (Quan sát ý định mở file /etc)                                   |
+|        [tp:sys_enter_openat]                 +-------------- [tp:sched_process_exit]            |
+|   (/etc/shadow,sudoers,gshadow,ld.so.preload)                 (Vòng đời TGID & PID Reuse)       |
 |                                              |                                                  |
 |                                              v                                                  |
-|                                   [BPF Perf Ring Buffer]                                        |
-|                       (event_t: 200 bytes, 8-byte aligned, BPF Ring Buffer)                     |
+|                        [BPF_PERCPU_ARRAY Scratch + BPF Perf Ring Buffer]                        |
+|                    (event_t: 200 bytes, 8-byte aligned, pidns_id, 64 pages)                     |
 +----------------------------------------------|--------------------------------------------------+
                                                |
-                                               v (Poll asynchronously)
+                                               v (Poll + lost_cb tracking)
 +-------------------------------------------------------------------------------------------------+
 |                                        USER SPACE AGENT                                         |
 |                                                                                                 |
-|   [agent/collector.py]  ---> BPFCollector (BCC Runtime, Auto-Cleanup via atexit/signal)         |
+|   [agent/collector.py]  ---> BPFCollector (BCC Runtime, Drop Stats, Auto-Cleanup)               |
 |                                      |                                                          |
 |                                      v                                                          |
-|   [agent/features.py]   ---> FeatureExtractor (Sliding Window 3.0s, Lineage, PID Reuse)         |
+|   [agent/features.py]   ---> FeatureExtractor (3s Event Window, Trusted Exec Path, PID Exit)    |
 |                                      |                                                          |
 |                                      +------------------------------------+                     |
 |                                      |                                    |                     |
 |                                      v                                    v                     |
 |                      [TẦNG 1: Rule-Based Fast Path]           [TẦNG 2: Machine Learning]        |
 |                      - PRIVESC-001 (commit_creds jump)        - Random Forest (P_Attack)        |
-|                      - PRIVESC-002 (GTFOBins SUID abuse)      - Isolation Forest (Anomaly)      |
-|                      - PRIVESC-003 (Suspicious path exec)     - StandardScaler                  |
-|                      - PRIVESC-004 (Service-spawned root)     - Composite Threat Score          |
-|                      - PRIVESC-005 (Sensitive file access)                |                     |
-|                      - PRIVESC-006 (Priv capability probe)                |                     |
+|                      - PRIVESC-005 (Sensitive file access)    - Isolation Forest (Anomaly)      |
+|                      - PRIVESC-006 (Priv capability probe)    - StandardScaler                  |
+|                      - PRIVESC-004 (Service-spawned root)     - Severity Threat Score & Cooldown|
+|                      - PRIVESC-003 (Suspicious path exec)                 |                     |
+|                      - PRIVESC-002 (GTFOBins SUID abuse)                  |                     |
 |                                      |                                    |                     |
 |                                      +------------------+-----------------+                     |
 |                                                         |                                       |
@@ -56,7 +56,7 @@ Repository: [https://github.com/Yusei1708/ebpf-privesc-detector](https://github.
 |                                      |                                    |                     |
 |                                      v                                    v                     |
 |                         [Rich SOC Dashboard UI]             [Structured JSONL Logging]          |
-|                         (Cảnh báo Terminal trực quan)       (alerts.jsonl chuẩn SIEM)           |
+|                         (Cảnh báo Terminal trực quan)       (alerts.jsonl chuẩn SIEM, 0600)     |
 +-------------------------------------------------------------------------------------------------+
 ```
 
@@ -65,21 +65,22 @@ Repository: [https://github.com/Yusei1708/ebpf-privesc-detector](https://github.
 ## 2. Giới Hạn Quan Sát Của eBPF Probes (Observability Boundaries)
 
 Hệ thống minh bạch về ranh giới dữ liệu được thu thập:
-1. **`tracepoint/syscalls/sys_enter_execve`**: Quan sát **lời gọi** thực thi nhị phân, tham số và danh tính caller tại thời điểm bắt đầu. Điểm đo này không kết luận tiến trình có exec thành công hay thất bại (ví dụ: file hỏng, thiếu quyền thực thi).
+1. **`tracepoint/syscalls/sys_enter_execve` & `sys_enter_execveat`**: Quan sát **lời gọi** thực thi nhị phân (kể cả thực thi fileless qua file descriptor / `memfd_create`), tham số và danh tính caller tại thời điểm bắt đầu. Điểm đo này không kết luận tiến trình có exec thành công hay thất bại (ví dụ: file hỏng, thiếu quyền thực thi).
 2. **`kprobe/commit_creds`**: Quan sát thời điểm kernel chuẩn bị áp dụng cấu trúc `struct cred` mới cho task. Cho phép bắt khoảnh khắc EUID hoặc UID thay đổi sang 0.
-3. **`kprobe/cap_capable`**: Quan sát kernel đang kiểm tra quyền đối với capability nhạy cảm (`CAP_SETUID`, `CAP_SYS_ADMIN`, `CAP_DAC_OVERRIDE`). Không thể kết luận từ entry rằng quyền này được cấp thuận hay bị từ chối.
-4. **`tracepoint/syscalls/sys_enter_openat`**: Quan sát **ý định (entry)** muốn mở file nhạy cảm (`/etc/shadow`, `/etc/sudoers`, `/etc/passwd`). **Tuyệt đối không khẳng định file đã được đọc thành công**, vì kernel VFS có thể trả về lỗi `-EACCES` (Permission Denied) sau đó.
+3. **`kprobe/cap_capable`**: Quan sát kernel đang kiểm tra quyền đối với các capability nhạy cảm (`CAP_DAC_OVERRIDE=1`, `CAP_SETGID=6`, `CAP_SETUID=7`, `CAP_NET_ADMIN=12`, `CAP_SYS_MODULE=16`, `CAP_SYS_PTRACE=19`, `CAP_SYS_ADMIN=21`). Không thể kết luận từ entry rằng quyền này được cấp thuận hay bị từ chối.
+4. **`tracepoint/syscalls/sys_enter_openat`**: Quan sát **ý định (entry)** muốn mở file nhạy cảm (`/etc/shadow`, `/etc/sudoers`, `/etc/passwd`, `/etc/gshadow`, `/etc/ld.so.preload`). **Tuyệt đối không khẳng định file đã được đọc thành công**, vì kernel VFS có thể trả về lỗi `-EACCES` (Permission Denied) sau đó.
+5. **`tracepoint/sched/sched_process_exit`**: Quan sát thời điểm luồng chính (`pid == tgid`) kết thúc đối với các tiến trình đang được theo dõi (`tracked_tgids`) nhằm giải quyết chính xác bài toán tái sử dụng PID (PID Reuse).
 
 ---
 
 ## 3. Danh Sách 8 Đặc Trưng Hành Vi (Behavioral Features)
 
-Trong mỗi cửa sổ trượt 3.0 giây (`Sliding Window 3.0s`), hệ thống trích xuất vector 8 đặc trưng:
-1. `exec_count`: Số lần gọi `execve` trong cửa sổ thời gian.
+Trong mỗi cửa sổ trượt 3.0 giây (`Sliding Window 3.0s`), hệ thống trích xuất vector 8 đặc trưng chỉ trong 1 lượt duyệt O(N):
+1. `exec_count`: Số lần gọi `execve`/`execveat` trong cửa sổ thời gian.
 2. `uid_change_flag`: Cờ chuyển đổi đặc quyền (1 nếu `UID != 0` chuyển sang `EUID == 0`).
-3. `is_whitelisted_bin`: `1` nếu nhị phân thuộc danh sách SUID hợp lệ (`sudo`, `su`, `passwd`, `pkexec`), `0` nếu là nhị phân ngoài whitelist (ví dụ: `find`, `python`, `sh`, `vim`).
-4. `suspicious_path_flag`: `1` nếu nhị phân được thực thi từ thư mục tạm nguy hiểm (kiểm tra ranh giới thư mục chuẩn xác: `/tmp/`, `/dev/shm/`, `/var/tmp/`, không nhầm lẫn tiền tố như `/tmpfoo`).
-5. `service_parent_flag`: `1` nếu tiến trình cha hoặc tổ tiên thuộc danh sách daemon dịch vụ mạng (`nginx`, `apache2`, `node`, `python`, `php-fpm`).
+3. `is_whitelisted_bin`: `1` nếu nhị phân thực thi từ `execve` thuộc danh sách SUID hợp lệ (`sudo`, `su`, `passwd`, `pkexec`, ...) **và** nằm trong thư mục hệ thống tin cậy (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`); `0` nếu ngoài danh sách hoặc chạy từ đường dẫn giả mạo (`/tmp/sudo`, traversal).
+4. `suspicious_path_flag`: `1` nếu nhị phân được thực thi từ thư mục tạm nguy hiểm (`/tmp`, `/dev/shm`, `/var/tmp`, `/run/user`, `/memfd:`, `(execveat:fd)` — giữ bền vững theo `ProcessNode.exe_path` suốt vòng đời tiến trình).
+5. `service_parent_flag`: `1` nếu tiến trình cha hoặc tổ tiên tối đa 5 cấp (kể cả đi qua shell trung gian `sh`/`bash`) thuộc danh sách daemon dịch vụ mạng/ứng dụng (`nginx`, `apache2`, `httpd`, `lighttpd`, `node`, `python3`, `php-fpm`).
 6. `sensitive_file_access`: Số lần phát sinh syscall yêu cầu mở file cấu hình nhạy cảm.
 7. `cap_check_count`: Số lần kernel kiểm tra các capability đặc quyền.
 8. `priv_syscall_rate`: Tần suất gọi syscall nhạy cảm trên một giây (tính theo khoảng thời gian thực tế của các sự kiện trong window).
@@ -88,14 +89,16 @@ Trong mỗi cửa sổ trượt 3.0 giây (`Sliding Window 3.0s`), hệ thống 
 
 ## 4. Danh Sách Các Luật Phát Hiện (Tier 1 Rules)
 
+Đánh giá theo thứ tự độ đặc hiệu giảm dần để tránh luật tổng quát che khuất luật đặc hiệu (`evaluate_all_rules`):
+
 | Mã Luật | Tên Luật | Mức Độ | Kỹ Thuật MITRE | Điều Kiện Kích Hoạt |
 | :--- | :--- | :--- | :--- | :--- |
 | **PRIVESC-001** | `RULE_COMMIT_CREDS_EUID_JUMP` | CRITICAL | T1548.001 | `commit_creds` chuyển sang `EUID=0` từ caller không đặc quyền và binary không thuộc whitelist. |
+| **PRIVESC-005** | `RULE_SENSITIVE_FILE_ACCESS_ATTEMPT`| HIGH | T1003.008 | Yêu cầu mở `/etc/shadow`, `/etc/sudoers`, `/etc/gshadow` hoặc `/etc/ld.so.preload` trong bối cảnh nghi vấn (`/tmp`, con của service, hoặc unwhitelisted root). |
+| **PRIVESC-006** | `RULE_PRIVILEGED_CAPABILITY_PROBE`| MEDIUM | T1548 | Tiến trình không đặc quyền (`uid != 0`) ngoài whitelist kích hoạt kiểm tra `CAP_SETUID=7`/`CAP_SYS_ADMIN=21`/`CAP_SYS_PTRACE=19`/`CAP_SYS_MODULE=16`/`CAP_SETGID=6` kèm ngữ cảnh rủi ro tương quan (`/tmp`, con của service, nhảy quyền, hoặc lặp kiểm tra kèm truy cập file nhạy cảm). |
+| **PRIVESC-004** | `RULE_SERVICE_SPAWNED_ROOT_SHELL`| CRITICAL | T1068 | Tiến trình bắt nguồn từ web/network/app daemon nâng quyền lên root (dấu hiệu Web Shell RCE). |
+| **PRIVESC-003** | `RULE_SUSPICIOUS_PATH_PRIV_EXEC`| HIGH | T1059 | Thực thi mã từ `/tmp`, `/dev/shm`, `/var/tmp`, `memfd` với `EUID == 0` hoặc nhảy quyền ngoài whitelist. |
 | **PRIVESC-002** | `RULE_GTFOBINS_SUID_ABUSE` | CRITICAL | T1548.001 | `uid_change_flag == 1` và `is_whitelisted_bin == 0` và `EUID == 0`. |
-| **PRIVESC-003** | `RULE_SUSPICIOUS_PATH_PRIV_EXEC`| HIGH | T1059 | Thực thi mã từ `/tmp` hoặc `/dev/shm` với `EUID == 0` ngoài whitelist. |
-| **PRIVESC-004** | `RULE_SERVICE_SPAWNED_ROOT_SHELL`| CRITICAL | T1068 | Tiến trình con của web/network daemon nâng quyền lên root (dấu hiệu Web Shell RCE). |
-| **PRIVESC-005** | `RULE_SENSITIVE_FILE_ACCESS_ATTEMPT`| HIGH | T1003.008 | Yêu cầu mở `/etc/shadow` trong bối cảnh nghi vấn (`/tmp`, con của service, hoặc unwhitelisted root). |
-| **PRIVESC-006** | `RULE_PRIVILEGED_CAPABILITY_PROBE`| MEDIUM | T1548 | Tiến trình không đặc quyền (`uid != 0`) ngoài whitelist kích hoạt kiểm tra `CAP_SETUID`/`CAP_SYS_ADMIN` kèm ngữ cảnh rủi ro tương quan (`/tmp`, con của service, nhảy quyền, hoặc lặp kiểm tra kèm truy cập file nhạy cảm). |
 
 ---
 
@@ -127,9 +130,12 @@ Bộ kiểm thử tự động kiểm tra trích xuất đặc trưng, sliding w
 .venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-### 6.2. Kiểm Thử Giao Diện Cảnh Báo Với Assertion Chặt Chẽ
+### 6.2. Kiểm Thử Giao Diện Cảnh Báo & Offline Telemetry Replay
 ```bash
 .venv/bin/python main.py --test-alert
+
+# Chạy phát lại & chấm điểm hybrid (Rule + ML) trên bộ telemetry mẫu
+.venv/bin/python main.py --replay ml/data/sample_telemetry.jsonl --no-log
 ```
 
 ### 6.3. Huấn Luyện Lại Mô Hình Machine Learning
@@ -137,8 +143,8 @@ Bộ kiểm thử tự động kiểm tra trích xuất đặc trưng, sliding w
 # Huấn luyện với tập dữ liệu mô phỏng theo phiên (Grouped Sessions chống rò rỉ dữ liệu)
 .venv/bin/python ml/train.py
 
-# Hoặc nạp tập dữ liệu telemetry thực tế có gán nhãn:
-.venv/bin/python ml/train.py --telemetry-file path/to/telemetry.jsonl
+# Hoặc kiểm tra / huấn luyện với telemetry thực tế có gán nhãn:
+.venv/bin/python ml/train.py --telemetry-file ml/data/sample_telemetry.jsonl --check-only
 ```
 
 ### 6.4. Chạy Giả Lập Tấn Công An Toàn (Zero-Footprint)
@@ -149,7 +155,7 @@ Kịch bản giả lập tấn công được đóng gói bên trong Docker cont
 
 ### 6.5. Khởi Chạy Giám Sát Nhân Thời Gian Thực (Cần Quyền Root)
 ```bash
-sudo .venv/bin/python main.py --alert-log alerts.jsonl
+sudo .venv/bin/python main.py --alert-log alerts.jsonl --cooldown 2.0
 ```
 
 ---
