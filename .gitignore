@@ -1,16 +1,22 @@
 # Environments
 .venv/
-*/.venv/
 venv/
-*/venv/
 env/
 
-# Python cache
+# Secrets & credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Python & test caches
 __pycache__/
-*/__pycache__/
-*/*/__pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.coverage
+.coverage.*
 
 # IDE & Editor
 .vscode/
@@ -19,9 +25,13 @@ __pycache__/
 *.swo
 *~
 
-# Logs & temp
+# Logs, alerts, benchmarks & temp
 *.log
 /tmp/
-alerts.jsonl
-*_alerts.jsonl
+alerts*.jsonl*
+*_alerts.jsonl*
 *_benchmark_result.json
+benchmarks/*.json
+
+# Note: Pretrained baseline models in ebpf-privesc-detector/ml/models/*.joblib
+# and dataset_summary.json are intentionally tracked for out-of-the-box replay.

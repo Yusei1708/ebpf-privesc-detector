@@ -1,5 +1,10 @@
-scikit-learn>=1.4.0
-pandas>=2.2.0
-numpy>=1.26.0
-joblib>=1.3.0
-rich>=13.0.0
+# System dependency (required for live eBPF kernel collection; not installed via PyPI):
+#   Arch Linux:    sudo pacman -S bcc python-bcc linux-lts-headers
+#   Debian/Ubuntu: sudo apt install bpfcc-tools python3-bpfcc linux-headers-$(uname -r)
+# Create venv with --system-site-packages so the virtualenv inherits python-bcc.
+
+scikit-learn>=1.4.0,<2.0.0
+pandas>=2.2.0,<3.0.0
+numpy>=1.26.0,<3.0.0
+joblib>=1.3.0,<2.0.0
+rich>=13.0.0,<15.0.0
