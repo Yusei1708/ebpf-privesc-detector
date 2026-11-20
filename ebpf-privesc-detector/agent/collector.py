@@ -32,7 +32,7 @@ class CEvent(ctypes.Structure):
         ("cap", ctypes.c_uint32),
         ("_pad", ctypes.c_uint32),       # Explicit 4-byte padding matching C struct
         ("cgroup_id", ctypes.c_uint64),
-        ("mntns_id", ctypes.c_uint64),
+        ("pidns_id", ctypes.c_uint64),   # PID namespace inode (portable across Linux 5.8-6.x)
         ("timestamp_ns", ctypes.c_uint64),
         ("comm", ctypes.c_char * 16),
         ("filename", ctypes.c_char * 128),
@@ -44,12 +44,18 @@ class BPFCollector:
     Quản lý vòng đời của eBPF Probes, thu thập telemetry từ Linux Kernel
     với cơ chế Auto-Cleanup tuyệt đối khi kết thúc hoặc gặp sự cố.
     """
-    def __init__(self, probe_path: Optional[str] = None, event_callback: Optional[Callable] = None):
+    def __init__(self, probe_path: Optional[str] = None, event_callback: Optional[Callable] = None, perf_page_cnt: int = 64):
         self.probe_path = probe_path or str(PROJECT_ROOT / "ebpf" / "probes.c")
         self.event_callback = event_callback
+        self.perf_page_cnt = int(perf_page_cnt)
         self.extractor = FeatureExtractor(window_size_seconds=3.0)
         self.bpf: Optional[Any] = None
         self.running = False
+        self.stats: Dict[str, int] = {
+            "events_processed": 0,
+            "events_lost": 0,
+            "alerts_triggered": 0,
+        }
 
         # Đăng ký cơ chế dọn dẹp khẩn cấp qua atexit và signal handler
         atexit.register(self.cleanup)
@@ -60,6 +66,11 @@ class BPFCollector:
         print(f"\n[!] Nhận tín hiệu ngắt {signum}. Đang dọn dẹp và tháo gỡ eBPF probes...")
         self.cleanup()
         sys.exit(0)
+
+    def _lost_event_cb(self, lost: int):
+        """Callback được BCC gọi khi Perf Ring Buffer bị đầy và làm rớt sự kiện kernel."""
+        self.stats["events_lost"] += int(lost)
+        print(f"[!] CẢNH BÁO PERF BUFFER: Bị rớt {lost} sự kiện từ Kernel (tổng lost={self.stats['events_lost']}).")
 
     def cleanup(self):
         """Tháo gỡ tất cả probe và giải phóng tài nguyên kernel"""
@@ -72,6 +83,14 @@ class BPFCollector:
             except Exception as e:
                 print(f"[-] Cảnh báo khi cleanup BPF: {e}")
             self.bpf = None
+            total = self.stats["events_processed"] + self.stats["events_lost"]
+            if total > 0:
+                drop_rate = (self.stats["events_lost"] / total) * 100.0
+                print(
+                    f"[*] Thống kê eBPF Perf Buffer: processed={self.stats['events_processed']}, "
+                    f"lost={self.stats['events_lost']} ({drop_rate:.2f}% drop), "
+                    f"alerts={self.stats['alerts_triggered']}"
+                )
             print("[✓] Hệ thống eBPF đã được dọn dẹp sạch sẽ 100% (Zero-Footprint).")
         else:
             self.running = False
@@ -79,6 +98,7 @@ class BPFCollector:
     def _process_event(self, cpu, data, size):
         """Callback xử lý sự kiện khi có dữ liệu từ eBPF Perf Ring Buffer"""
         event = ctypes.cast(data, ctypes.POINTER(CEvent)).contents
+        self.stats["events_processed"] += 1
 
         event_dict = {
             "event_type": event.event_type,
@@ -89,13 +109,18 @@ class BPFCollector:
             "euid": event.euid,
             "cap": event.cap,
             "cgroup_id": event.cgroup_id,
-            "mntns_id": event.mntns_id,
+            "pidns_id": event.pidns_id,
             "timestamp_ns": event.timestamp_ns,
             "comm": event.comm.decode("utf-8", "replace"),
             "filename": event.filename.decode("utf-8", "replace"),
         }
 
         ev_ts = get_event_timestamp(event_dict, fallback_time=time.monotonic())
+
+        # Sự kiện thoát tiến trình chỉ dùng để đánh dấu vòng đời & xử lý PID reuse chính xác
+        if event_dict["event_type"] == 5:
+            self.extractor.mark_process_exit(event_dict["tgid"], event_time=ev_ts)
+            return
 
         # Cập nhật thông tin tiến trình và cây phả hệ cùng miền thời gian monotonic với kernel
         self.extractor.update_process(
@@ -105,8 +130,10 @@ class BPFCollector:
             uid=event_dict["uid"],
             euid=event_dict["euid"],
             cgroup_id=event_dict["cgroup_id"],
-            mntns_id=event_dict["mntns_id"],
+            mntns_id=0,
             event_time=ev_ts,
+            pidns_id=event_dict["pidns_id"],
+            exe_path=event_dict["filename"] if event_dict["event_type"] == 1 else None,
         )
 
         # Thêm sự kiện vào Sliding Window
@@ -117,7 +144,9 @@ class BPFCollector:
 
         # Chuyển tiếp tới hàm callback phát hiện bất thường (nếu có)
         if self.event_callback:
-            self.event_callback(event_dict, feature_vec, raw_features, self.extractor)
+            alert_res = self.event_callback(event_dict, feature_vec, raw_features, self.extractor)
+            if alert_res:
+                self.stats["alerts_triggered"] += 1
 
     def start(self):
         """Nạp chương trình eBPF vào Kernel và lắng nghe dữ liệu"""
@@ -146,9 +175,13 @@ class BPFCollector:
 
             # Nạp BCC eBPF Program
             self.bpf = BPF(text=bpf_source)
-            self.bpf["events"].open_perf_buffer(self._process_event)
+            self.bpf["events"].open_perf_buffer(
+                self._process_event,
+                page_cnt=self.perf_page_cnt,
+                lost_cb=self._lost_event_cb,
+            )
             self.running = True
-            print("[✓] eBPF Probes đã gắn thành công vào sys_enter_execve, commit_creds, cap_capable, sys_enter_openat.")
+            print("[✓] eBPF Probes đã gắn thành công vào sys_enter_execve, sys_enter_execveat, commit_creds, cap_capable, sys_enter_openat, sched_process_exit.")
             print("[*] Đang giám sát các sự kiện đặc quyền theo thời gian thực (Nhấn Ctrl+C để dừng)...")
         except Exception as e:
             print(f"[X] LỖI NẠP HOẶC BIÊN DỊCH eBPF PROBE: {e}")
