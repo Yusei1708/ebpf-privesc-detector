@@ -39,36 +39,36 @@ def generate_synthetic_telemetry(n_sessions: int = 500) -> pd.DataFrame:
     - 85% Sessions bình thường (Benign developers, web daemon, admin sudo hợp lệ)
     - 15% Sessions tấn công (SUID abuse, dropped exploit /tmp, web shell privilege escalation)
     """
-    np.random.seed(42)
+    rng = np.random.default_rng(42)
     session_rows = []
 
     for sid in range(n_sessions):
-        is_attack_session = (np.random.rand() < 0.15)
+        is_attack_session = bool(rng.random() < 0.15)
         session_name = f"session_{sid:04d}"
-        session_len = np.random.randint(5, 25)
+        session_len = int(rng.integers(5, 25))
 
         if not is_attack_session:
             # 80% user bình thường, 20% admin dùng sudo hợp lệ
-            is_admin_sudo = (np.random.rand() < 0.20)
+            is_admin_sudo = bool(rng.random() < 0.20)
             for _ in range(session_len):
                 if is_admin_sudo:
-                    exec_c = np.random.poisson(lam=2.5)
-                    uid_ch = np.random.choice([0, 1], p=[0.2, 0.8])
+                    exec_c = int(rng.poisson(lam=2.5))
+                    uid_ch = int(rng.choice([0, 1], p=[0.2, 0.8]))
                     is_white = 1  # 1: binary trong whitelist (sudo, su)
                     susp_p = 0
                     serv_p = 0
-                    sens_f = np.random.choice([0, 1], p=[0.9, 0.1])
-                    cap_c = np.random.poisson(lam=1.0)
-                    priv_r = np.random.uniform(0.5, 2.0)
+                    sens_f = int(rng.choice([0, 1], p=[0.9, 0.1]))
+                    cap_c = int(rng.poisson(lam=1.0))
+                    priv_r = float(rng.uniform(0.5, 2.0))
                 else:
-                    exec_c = np.random.poisson(lam=1.2)
+                    exec_c = int(rng.poisson(lam=1.2))
                     uid_ch = 0
                     is_white = 0  # bình thường
-                    susp_p = int(np.random.rand() < 0.01)
-                    serv_p = int(np.random.rand() < 0.02)
+                    susp_p = int(rng.random() < 0.01)
+                    serv_p = int(rng.random() < 0.02)
                     sens_f = 0
-                    cap_c = int(np.random.rand() < 0.02)
-                    priv_r = np.random.uniform(0.1, 1.0)
+                    cap_c = int(rng.random() < 0.02)
+                    priv_r = float(rng.uniform(0.1, 1.0))
 
                 session_rows.append({
                     "session_id": session_name,
@@ -84,32 +84,32 @@ def generate_synthetic_telemetry(n_sessions: int = 500) -> pd.DataFrame:
                 })
         else:
             # Session tấn công
-            attack_type = np.random.choice(["suid_abuse", "tmp_exploit", "webshell"])
+            attack_type = str(rng.choice(["suid_abuse", "tmp_exploit", "webshell"]))
             for step in range(session_len):
                 # Các bước đầu có thể là trinh sát (benign), các bước sau là khai thác (attack)
                 is_exploit_step = (step >= (session_len // 2))
 
                 if not is_exploit_step:
                     # Giai đoạn thăm dò trước khai thác
-                    exec_c = np.random.poisson(lam=1.5)
+                    exec_c = int(rng.poisson(lam=1.5))
                     uid_ch = 0
                     is_white = 0
                     susp_p = int(attack_type == "tmp_exploit")
                     serv_p = int(attack_type == "webshell")
                     sens_f = 0
                     cap_c = 0
-                    priv_r = np.random.uniform(0.5, 1.5)
+                    priv_r = float(rng.uniform(0.5, 1.5))
                     lbl = 0
                 else:
                     # Giai đoạn kích hoạt leo thang đặc quyền
-                    exec_c = np.random.poisson(lam=5.0)
+                    exec_c = int(rng.poisson(lam=5.0))
                     uid_ch = 1
                     is_white = 0  # 0: binary unwhitelisted (find, bash, custom exploit)
-                    susp_p = 1 if attack_type == "tmp_exploit" else int(np.random.rand() < 0.4)
+                    susp_p = 1 if attack_type == "tmp_exploit" else int(rng.random() < 0.4)
                     serv_p = 1 if attack_type == "webshell" else 0
-                    sens_f = np.random.choice([1, 2, 3], p=[0.5, 0.3, 0.2])
-                    cap_c = np.random.poisson(lam=2.5)
-                    priv_r = np.random.uniform(3.0, 8.0)
+                    sens_f = int(rng.choice([1, 2, 3], p=[0.5, 0.3, 0.2]))
+                    cap_c = int(rng.poisson(lam=2.5))
+                    priv_r = float(rng.uniform(3.0, 8.0))
                     lbl = 1
 
                 session_rows.append({
@@ -136,9 +136,10 @@ def train_models(telemetry_file: Optional[str] = None, check_only: bool = False)
         print(f"[*] Đang nạp dữ liệu telemetry thực tế từ: {telemetry_file}")
         from ml.telemetry_loader import TelemetryLoader
         loader = TelemetryLoader()
-        if telemetry_file.endswith(".jsonl"):
+        lower_path = telemetry_file.lower()
+        if lower_path.endswith(".jsonl"):
             events = loader.load_jsonl(telemetry_file)
-        elif telemetry_file.endswith(".csv"):
+        elif lower_path.endswith(".csv"):
             events = loader.load_csv(telemetry_file)
         else:
             raise ValueError("Định dạng file không được hỗ trợ. Vui lòng cung cấp file .jsonl hoặc .csv")
@@ -272,6 +273,14 @@ def train_models(telemetry_file: Optional[str] = None, check_only: bool = False)
     )
     iso_model.fit(X_train_benign)
 
+    # Đánh giá Isolation Forest trên tập kiểm thử độc lập
+    iso_pred = iso_model.predict(X_test_scaled)
+    benign_mask = y_test == 0
+    attack_mask = y_test == 1
+    iso_benign_fpr = float(np.mean(iso_pred[benign_mask] == -1)) if np.any(benign_mask) else 0.0
+    iso_attack_rate = float(np.mean(iso_pred[attack_mask] == -1)) if np.any(attack_mask) else 0.0
+    print(f"Isolation Forest - Benign Outlier Rate (FPR): {iso_benign_fpr * 100:.2f}% | Attack Anomaly Rate: {iso_attack_rate * 100:.2f}%")
+
     # 6. Lưu lại Models, Scaler và Metadata
     scaler_path = MODELS_DIR / "scaler.joblib"
     rf_path = MODELS_DIR / "random_forest.joblib"
@@ -294,6 +303,9 @@ def train_models(telemetry_file: Optional[str] = None, check_only: bool = False)
         "n_samples": len(df),
         "n_train": len(train_df),
         "n_test": len(test_df),
+        "n_sessions_total": int(n_sessions),
+        "n_sessions_train": int(train_df["session_id"].nunique()),
+        "n_sessions_test": int(test_df["session_id"].nunique()),
         "features": FEATURE_NAMES,
         "evaluation_metrics": {
             "roc_auc": round(float(rf_auc), 4),
@@ -308,6 +320,10 @@ def train_models(telemetry_file: Optional[str] = None, check_only: bool = False)
                 "false_negative": int(fn),
                 "true_positive": int(tp),
             },
+        },
+        "isolation_forest_metrics": {
+            "benign_fpr": round(iso_benign_fpr, 4),
+            "attack_detection_rate": round(iso_attack_rate, 4),
         },
         "feature_importances": {name: round(float(imp), 4) for name, imp in zip(FEATURE_NAMES, importances)},
     }

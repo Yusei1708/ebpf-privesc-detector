@@ -33,6 +33,25 @@ class TelemetryValidationError(ValueError):
         self.raw_data = raw_data
 
 
+def _parse_strict_int(val: Any) -> int:
+    """Chuyển đổi nghiêm ngặt sang số nguyên; từ chối bool/np.bool_ và số thực không nguyên."""
+    if isinstance(val, (bool, np.bool_)):
+        raise ValueError("Giá trị boolean không hợp lệ cho trường số nguyên")
+    if isinstance(val, (int, np.integer)):
+        return int(val)
+    if isinstance(val, (float, np.floating)):
+        fval = float(val)
+        if not np.isfinite(fval) or not fval.is_integer():
+            raise ValueError(f"Giá trị '{val}' không phải số nguyên hợp lệ")
+        return int(fval)
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            raise ValueError("Chuỗi rỗng")
+        return int(s)
+    raise ValueError(f"Kiểu dữ liệu không hợp lệ: {type(val).__name__}")
+
+
 class TelemetryLoader:
     """
     Nạp và xác thực dữ liệu telemetry gán nhãn thực tế từ file CSV hoặc JSONL
@@ -47,6 +66,14 @@ class TelemetryLoader:
         "comm",
         "label",
         "session_id",
+    )
+
+    OPTIONAL_NONNEG_INT_FIELDS = (
+        "ppid",
+        "cap",
+        "cgroup_id",
+        "mntns_id",
+        "pidns_id",
     )
 
     def __init__(self, schema_file: Optional[Path] = None):
@@ -64,9 +91,9 @@ class TelemetryLoader:
 
     def validate_record(self, record: Dict[str, Any], line_no: int) -> Dict[str, Any]:
         """
-        Kiểm tra tính hợp lệ của bản ghi telemetry:
+        Kiểm tra tính hợp lệ của bản ghi telemetry (không làm biến đổi dict đầu vào):
         - Kiểm tra các trường bắt buộc
-        - Kiểm tra kiểu dữ liệu và miền giá trị
+        - Kiểm tra kiểu dữ liệu (từ chối bool cho trường số) và miền giá trị
         - Không âm thầm gán giá trị mặc định cho dữ liệu bị khuyết thiếu quan trọng
         """
         if not isinstance(record, dict):
@@ -82,79 +109,109 @@ class TelemetryLoader:
                 record
             )
 
+        validated = dict(record)
+
         # 1. Kiểm tra sự tồn tại của các trường bắt buộc
         for req in self.REQUIRED_FIELDS:
-            if req not in record or record[req] is None or (isinstance(record[req], str) and not record[req].strip()):
+            if req not in validated or validated[req] is None or (isinstance(validated[req], str) and not validated[req].strip()):
                 raise TelemetryValidationError(line_no, req, f"Trường bắt buộc '{req}' bị thiếu hoặc có giá trị rỗng", record)
 
         # 2. Kiểm tra event_type
         try:
-            ev_type = int(record["event_type"])
-            if ev_type not in (1, 2, 3, 4):
-                raise TelemetryValidationError(line_no, "event_type", f"Giá trị event_type không hợp lệ ({ev_type}). Phải là 1 (execve), 2 (commit_creds), 3 (cap_capable), hoặc 4 (openat)", record)
-            record["event_type"] = ev_type
+            ev_type = _parse_strict_int(validated["event_type"])
+            if ev_type not in (1, 2, 3, 4, 5):
+                raise TelemetryValidationError(
+                    line_no,
+                    "event_type",
+                    f"Giá trị event_type không hợp lệ ({ev_type}). Phải là 1 (execve/execveat), 2 (commit_creds), 3 (cap_capable), 4 (openat), hoặc 5 (process_exit)",
+                    record,
+                )
+            validated["event_type"] = ev_type
+        except TelemetryValidationError:
+            raise
         except (ValueError, TypeError):
             raise TelemetryValidationError(line_no, "event_type", "event_type phải là số nguyên", record)
 
         # 3. Kiểm tra các định danh tiến trình và người dùng (TGID, PID, UID, EUID)
         for num_field in ("tgid", "pid", "uid", "euid"):
             try:
-                val = int(record[num_field])
+                val = _parse_strict_int(validated[num_field])
                 if val < 0:
                     raise TelemetryValidationError(line_no, num_field, f"Giá trị không được âm: {val}", record)
-                record[num_field] = val
+                validated[num_field] = val
+            except TelemetryValidationError:
+                raise
             except (ValueError, TypeError):
                 raise TelemetryValidationError(line_no, num_field, f"Trường '{num_field}' phải là số nguyên hợp lệ", record)
 
-        if record["tgid"] < 1:
-            raise TelemetryValidationError(line_no, "tgid", f"TGID (Process ID) phải >= 1, nhận được {record['tgid']}", record)
+        if validated["tgid"] < 1:
+            raise TelemetryValidationError(line_no, "tgid", f"TGID (Process ID) phải >= 1, nhận được {validated['tgid']}", record)
+        if validated["pid"] < 1:
+            raise TelemetryValidationError(line_no, "pid", f"PID (Thread ID) phải >= 1, nhận được {validated['pid']}", record)
+
+        # Kiểm tra các trường số nguyên không âm tùy chọn nếu có mặt
+        for opt_field in self.OPTIONAL_NONNEG_INT_FIELDS:
+            if opt_field in validated and validated[opt_field] is not None:
+                try:
+                    opt_val = _parse_strict_int(validated[opt_field])
+                    if opt_val < 0:
+                        raise TelemetryValidationError(line_no, opt_field, f"Giá trị không được âm: {opt_val}", record)
+                    validated[opt_field] = opt_val
+                except TelemetryValidationError:
+                    raise
+                except (ValueError, TypeError):
+                    raise TelemetryValidationError(line_no, opt_field, f"Trường '{opt_field}' phải là số nguyên hợp lệ", record)
 
         # 4. Kiểm tra nhãn huấn luyện (label: 0 hoặc 1)
         try:
-            lbl = int(record["label"])
+            lbl = _parse_strict_int(validated["label"])
             if lbl not in (0, 1):
                 raise TelemetryValidationError(line_no, "label", f"Nhãn 'label' phải là 0 (Benign) hoặc 1 (Attack), nhận được {lbl}", record)
-            record["label"] = lbl
+            validated["label"] = lbl
+        except TelemetryValidationError:
+            raise
         except (ValueError, TypeError):
             raise TelemetryValidationError(line_no, "label", "Trường 'label' phải là số nguyên (0 hoặc 1)", record)
 
         # 5. Kiểm tra session_id (bắt buộc để GroupShuffleSplit không bị rò rỉ dữ liệu)
-        session_id = str(record["session_id"]).strip()
+        session_id = str(validated["session_id"]).strip()
         if not session_id:
             raise TelemetryValidationError(line_no, "session_id", "session_id không được để trống", record)
-        record["session_id"] = session_id
+        validated["session_id"] = session_id
 
         # 6. Kiểm tra timestamp
         has_ts = False
-        if "timestamp_ns" in record and record["timestamp_ns"] is not None:
+        if "timestamp_ns" in validated and validated["timestamp_ns"] is not None:
             try:
-                ts_ns = int(record["timestamp_ns"])
+                ts_ns = _parse_strict_int(validated["timestamp_ns"])
                 if ts_ns > 0:
                     has_ts = True
-                    record["timestamp_ns"] = ts_ns
+                    validated["timestamp_ns"] = ts_ns
             except (ValueError, TypeError):
                 pass
 
-        if not has_ts and "timestamp_iso" in record and record["timestamp_iso"]:
+        if not has_ts and "timestamp_iso" in validated and validated["timestamp_iso"]:
             try:
-                datetime.fromisoformat(str(record["timestamp_iso"]).replace("Z", "+00:00"))
+                datetime.fromisoformat(str(validated["timestamp_iso"]).replace("Z", "+00:00"))
                 has_ts = True
             except Exception:
-                raise TelemetryValidationError(line_no, "timestamp_iso", f"timestamp_iso không đúng chuẩn ISO-8601: {record.get('timestamp_iso')}", record)
+                raise TelemetryValidationError(line_no, "timestamp_iso", f"timestamp_iso không đúng chuẩn ISO-8601: {validated.get('timestamp_iso')}", record)
 
-        if not has_ts and "timestamp" in record and record["timestamp"] is not None:
-            try:
-                ts_sec = float(record["timestamp"])
-                if ts_sec > 0:
-                    has_ts = True
-                    record["timestamp"] = ts_sec
-            except (ValueError, TypeError):
-                pass
+        if not has_ts and "timestamp" in validated and validated["timestamp"] is not None:
+            raw_ts = validated["timestamp"]
+            if not isinstance(raw_ts, (bool, np.bool_)):
+                try:
+                    ts_sec = float(raw_ts)
+                    if np.isfinite(ts_sec) and ts_sec > 0:
+                        has_ts = True
+                        validated["timestamp"] = ts_sec
+                except (ValueError, TypeError):
+                    pass
 
         if not has_ts:
             raise TelemetryValidationError(line_no, "timestamp", "Bản ghi phải có ít nhất một trường thời gian hợp lệ (timestamp_ns, timestamp_iso, hoặc timestamp)", record)
 
-        return record
+        return validated
 
     def load_jsonl(self, file_path: str) -> List[Dict[str, Any]]:
         """Đọc và xác thực danh sách bản ghi telemetry từ file JSONL"""
@@ -184,11 +241,15 @@ class TelemetryLoader:
         if not path.exists():
             raise FileNotFoundError(f"Không tìm thấy file telemetry tại: {file_path}")
 
-        df = pd.read_csv(path)
+        try:
+            df = pd.read_csv(path)
+        except pd.errors.EmptyDataError:
+            raise TelemetryValidationError(1, "csv_format", "File CSV rỗng hoặc không có dòng tiêu đề hợp lệ")
+
         records = []
         # Header là dòng 1, dữ liệu bắt đầu từ dòng 2
         for idx, row in df.iterrows():
-            line_no = idx + 2
+            line_no = int(idx) + 2
             row_dict = row.to_dict()
             # Bỏ NaN pandas
             clean_dict = {k: v for k, v in row_dict.items() if pd.notna(v)}
@@ -199,32 +260,47 @@ class TelemetryLoader:
 
     def convert_events_to_features(self, events: List[Dict[str, Any]]) -> pd.DataFrame:
         """
-        Duyệt chuỗi sự kiện đã được xác thực qua FeatureExtractor
-        để trích xuất ma trận 8 đặc trưng cùng nhãn và session_id.
+        Duyệt chuỗi sự kiện đã được xác thực qua FeatureExtractor cô lập theo từng session_id
+        để trích xuất ma trận 8 đặc trưng mà không làm rò rỉ ngữ cảnh/PID giữa các phiên.
         """
-        extractor = FeatureExtractor(window_size_seconds=3.0)
-        feature_rows = []
+        extractors: Dict[str, FeatureExtractor] = {}
+        feature_rows: List[Dict[str, Any]] = []
 
         for ev in events:
-            tgid = ev["tgid"]
+            sid = str(ev["session_id"])
+            if sid not in extractors:
+                extractors[sid] = FeatureExtractor(window_size_seconds=3.0)
+            extractor = extractors[sid]
+
+            tgid = int(ev["tgid"])
+            ev_type = int(ev["event_type"])
             ev_ts = get_event_timestamp(ev)
+
+            if ev_type == 5:
+                extractor.mark_process_exit(tgid, event_time=ev_ts)
+                continue
 
             extractor.update_process(
                 pid=tgid,
-                ppid=int(ev.get("ppid", 0)),
-                comm=str(ev.get("comm", "")),
+                ppid=int(ev.get("ppid", 0) or 0),
+                comm=str(ev.get("comm", "") or ""),
                 uid=int(ev["uid"]),
                 euid=int(ev["euid"]),
-                cgroup_id=int(ev.get("cgroup_id", 0)),
-                mntns_id=int(ev.get("mntns_id", 0)),
+                cgroup_id=int(ev.get("cgroup_id", 0) or 0),
+                mntns_id=int(ev.get("mntns_id", 0) or 0),
                 event_time=ev_ts,
+                pidns_id=int(ev.get("pidns_id", 0) or 0),
+                exe_path=str(ev.get("filename", "") or "") if ev_type == 1 else None,
             )
             extractor.add_event(ev)
-            vec, raw_feat = extractor.extract_features(tgid, ev)
+            _, raw_feat = extractor.extract_features(tgid, ev)
 
             row = dict(raw_feat)
-            row["session_id"] = ev["session_id"]
+            row["session_id"] = sid
             row["label"] = int(ev["label"])
             feature_rows.append(row)
+
+        if not feature_rows:
+            return pd.DataFrame(columns=FEATURE_NAMES + ["session_id", "label"])
 
         return pd.DataFrame(feature_rows)

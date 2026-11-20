@@ -36,8 +36,8 @@
     },
     "event_type": {
       "type": "integer",
-      "enum": [1, 2, 3, 4],
-      "description": "1: sys_enter_execve, 2: commit_creds, 3: cap_capable, 4: sys_enter_openat"
+      "enum": [1, 2, 3, 4, 5],
+      "description": "1: sys_enter_execve/execveat, 2: commit_creds, 3: cap_capable, 4: sys_enter_openat, 5: sched_process_exit"
     },
     "tgid": {
       "type": "integer",
@@ -67,17 +67,22 @@
     "cap": {
       "type": "integer",
       "minimum": 0,
-      "description": "Mã capability khi event_type=3 (ví dụ 10: CAP_SETUID, 21: CAP_SYS_ADMIN)"
+      "description": "Mã capability khi event_type=3 (ví dụ 7: CAP_SETUID, 21: CAP_SYS_ADMIN)"
     },
     "cgroup_id": {
       "type": "integer",
       "minimum": 0,
       "description": "Cgroup v2 ID nhằm nhận diện ranh giới container"
     },
+    "pidns_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Inode number của PID Namespace"
+    },
     "mntns_id": {
       "type": "integer",
       "minimum": 0,
-      "description": "Inode number của Mount Namespace"
+      "description": "Inode number của Mount Namespace (tương thích telemetry cũ)"
     },
     "comm": {
       "type": "string",
