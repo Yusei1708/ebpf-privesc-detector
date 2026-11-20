@@ -117,13 +117,13 @@ class TestDetectionRules(unittest.TestCase):
         self.assertEqual(match.rule_id, "PRIVESC-005")
 
     def test_rule_privileged_capability_probe_correlated(self):
-        """PRIVESC-006: Bắt kiểm tra capability khi có tín hiệu rủi ro ngữ cảnh (ví dụ: chạy từ /tmp)"""
+        """PRIVESC-006: Bắt kiểm tra CAP_SETUID (cap=7) khi có tín hiệu rủi ro ngữ cảnh (ví dụ: chạy từ /tmp)"""
         event = {
             "event_type": 3,  # cap_capable
             "uid": 1000,
             "euid": 1000,
             "comm": "exploit",
-            "cap": 10,  # CAP_SETUID
+            "cap": 7,  # CAP_SETUID theo Linux UAPI
         }
         raw_feat = {
             "uid_change_flag": 0,
@@ -136,6 +136,25 @@ class TestDetectionRules(unittest.TestCase):
         self.assertTrue(hit)
         self.assertEqual(match.rule_id, "PRIVESC-006")
         self.assertEqual(match.severity, "MEDIUM")
+
+    def test_cap_net_bind_service_10_not_treated_as_setuid(self):
+        """Giá trị cap=10 (CAP_NET_BIND_SERVICE) không bị nhầm là CAP_SETUID (7)"""
+        event = {
+            "event_type": 3,
+            "uid": 1000,
+            "euid": 1000,
+            "comm": "server",
+            "cap": 10,
+        }
+        raw_feat = {
+            "uid_change_flag": 0,
+            "is_whitelisted_bin": 0,
+            "suspicious_path_flag": 1,
+            "service_parent_flag": 0,
+        }
+        hit, match = self.detector.evaluate_rules(event, raw_feat)
+        self.assertFalse(hit)
+        self.assertIsNone(match)
 
     def test_rule_privileged_capability_probe_benign_no_context(self):
         """PRIVESC-006: cap_capable thông thường không có ngữ cảnh rủi ro KHÔNG ĐƯỢC báo động giả"""
@@ -217,6 +236,71 @@ class TestDetectionRules(unittest.TestCase):
         hit, match = self.detector.evaluate_rules(event, raw_feat)
         self.assertFalse(hit)
         self.assertIsNone(match)
+
+    def test_no_rule_shadowing_evaluate_all_rules(self):
+        """Các luật đặc hiệu (PRIVESC-005, 004, 003) không bị PRIVESC-002 che khuất và trả đủ matched_rules"""
+        event = {
+            "event_type": 4,
+            "uid": 33,
+            "euid": 0,
+            "comm": "exploit",
+            "filename": "/etc/shadow",
+        }
+        raw_feat = {
+            "uid_change_flag": 1,
+            "is_whitelisted_bin": 0,
+            "suspicious_path_flag": 1,
+            "service_parent_flag": 1,
+        }
+        matches = self.detector.evaluate_all_rules(event, raw_feat)
+        rule_ids = [m.rule_id for m in matches]
+        self.assertEqual(rule_ids[0], "PRIVESC-005")
+        self.assertIn("PRIVESC-004", rule_ids)
+        self.assertIn("PRIVESC-003", rule_ids)
+        self.assertIn("PRIVESC-002", rule_ids)
+
+    def test_spoofed_tmp_sudo_cannot_bypass_rules(self):
+        """Nhị phân giả mạo /tmp/sudo vẫn phải kích hoạt luật dù raw_features không truyền sẵn is_whitelisted_bin"""
+        event = {
+            "event_type": 1,
+            "uid": 1000,
+            "euid": 0,
+            "comm": "sudo",
+            "filename": "/tmp/sudo",
+        }
+        raw_feat = {
+            "uid_change_flag": 1,
+            "suspicious_path_flag": 1,
+            "service_parent_flag": 0,
+        }
+        matches = self.detector.evaluate_all_rules(event, raw_feat)
+        rule_ids = [m.rule_id for m in matches]
+        self.assertEqual(rule_ids[0], "PRIVESC-003")
+        self.assertIn("PRIVESC-002", rule_ids)
+
+    def test_alert_cooldown_suppresses_duplicates(self):
+        """Chống bão cảnh báo (cooldown) cho cùng (tgid, rule_id) trong khoảng thời gian cấu hình"""
+        cooldown_detector = PrivEscDetector(alert_cooldown_seconds=5.0, quiet=True)
+        feat_vec = np.array([4, 1, 0, 0, 0, 1, 1, 2.0], dtype=np.float32)
+        raw_feat = {
+            "exec_count": 4,
+            "uid_change_flag": 1,
+            "is_whitelisted_bin": 0,
+            "suspicious_path_flag": 0,
+            "service_parent_flag": 0,
+            "sensitive_file_access": 1,
+            "cap_check_count": 1,
+            "priv_syscall_rate": 2.0,
+        }
+
+        ev1 = {"event_type": 1, "tgid": 999, "pid": 999, "uid": 1000, "euid": 0, "comm": "find", "filename": "/usr/bin/find", "timestamp": 100.0}
+        ev2 = {**ev1, "timestamp": 101.5}  # Trong khoảng cooldown 5s -> bị triệt tiêu
+        ev3 = {**ev1, "timestamp": 106.0}  # Sau 5s -> cảnh báo lại bình thường
+
+        self.assertIsNotNone(cooldown_detector.analyze(ev1, feat_vec, raw_feat))
+        self.assertIsNone(cooldown_detector.analyze(ev2, feat_vec, raw_feat))
+        self.assertEqual(cooldown_detector.suppressed_alerts, 1)
+        self.assertIsNotNone(cooldown_detector.analyze(ev3, feat_vec, raw_feat))
 
     def test_benign_normal_user_command_no_false_positive(self):
         """Người dùng thông thường chạy lệnh không đặc quyền KHÔNG ĐƯỢC báo động"""

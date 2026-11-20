@@ -22,3 +22,6 @@ __pycache__/
 # Logs & temp
 *.log
 /tmp/
+alerts.jsonl
+*_alerts.jsonl
+*_benchmark_result.json

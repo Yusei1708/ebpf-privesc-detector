@@ -11,10 +11,12 @@ set -euo pipefail
 
 CONTAINER_NAME="privesc-safe-sim-$$"
 TMP_DIR=$(mktemp -d /tmp/privesc-sim.XXXXXX)
+RUNTIME=""
 
-# Lưu lại checksum và thuộc tính của các file nhạy cảm trên máy Host để kiểm chứng sau cùng
-HOST_SHADOW_MD5=$(stat -c "%a %Y" /etc/shadow 2>/dev/null || echo "N/A")
-HOST_PASSWD_MD5=$(stat -c "%a %Y" /etc/passwd 2>/dev/null || echo "N/A")
+# Lưu lại thuộc tính quyền hạn và mtime của các file nhạy cảm trên máy Host để kiểm chứng sau cùng
+HOST_SHADOW_STAT=$(stat -c "%a %Y" /etc/shadow 2>/dev/null || echo "N/A")
+HOST_PASSWD_STAT=$(stat -c "%a %Y" /etc/passwd 2>/dev/null || echo "N/A")
+HOST_SUDOERS_STAT=$(stat -c "%a %Y" /etc/sudoers 2>/dev/null || echo "N/A")
 
 # ------------------------------------------------------------------------------
 # HÀM CLEANUP TỰ ĐỘNG & ROLLBACK (Bắt buộc theo Safety Rule #2)
@@ -23,13 +25,13 @@ cleanup() {
     local exit_code=$?
     echo -e "\n\033[1;33m[!] Bắt đầu cơ chế Auto-Cleanup & Rollback trạng thái...\033[0m"
 
-    # 1. Dừng và xóa container giả lập (nếu còn sót lại)
-    if command -v docker >/dev/null 2>&1; then
+    # 1. Dừng và xóa container giả lập theo đúng runtime đã kích hoạt (nếu còn sót lại)
+    if [[ "${RUNTIME:-}" == "docker" ]]; then
         if docker ps -a -q -f name="${CONTAINER_NAME}" 2>/dev/null | grep -q .; then
             echo "[+] Dừng và xóa Docker container: ${CONTAINER_NAME}..."
             docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
         fi
-    elif command -v podman >/dev/null 2>&1; then
+    elif [[ "${RUNTIME:-}" == "podman" ]]; then
         if podman ps -a -q -f name="${CONTAINER_NAME}" 2>/dev/null | grep -q .; then
             echo "[+] Dừng và xóa Podman container: ${CONTAINER_NAME}..."
             podman rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
@@ -44,21 +46,22 @@ cleanup() {
 
     # 3. Healthcheck toàn vẹn máy Host Arch Linux
     echo -e "\n\033[1;36m=== HEALTHCHECK BẢO VỆ MÁY CHỦ ARCH LINUX ===\033[0m"
-    local curr_shadow_md5 curr_passwd_md5
-    curr_shadow_md5=$(stat -c "%a %Y" /etc/shadow 2>/dev/null || echo "N/A")
-    curr_passwd_md5=$(stat -c "%a %Y" /etc/passwd 2>/dev/null || echo "N/A")
+    local curr_shadow_stat curr_passwd_stat curr_sudoers_stat
+    curr_shadow_stat=$(stat -c "%a %Y" /etc/shadow 2>/dev/null || echo "N/A")
+    curr_passwd_stat=$(stat -c "%a %Y" /etc/passwd 2>/dev/null || echo "N/A")
+    curr_sudoers_stat=$(stat -c "%a %Y" /etc/sudoers 2>/dev/null || echo "N/A")
 
-    if [[ "${HOST_SHADOW_MD5}" == "${curr_shadow_md5}" ]] && [[ "${HOST_PASSWD_MD5}" == "${curr_passwd_md5}" ]]; then
-        echo -e "\033[1;32m[✓] BẢO VỆ TOÀN VẸN 100%: Hệ thống file Host (/etc/shadow, /etc/passwd) không hề bị thay đổi!\033[0m"
+    if [[ "${HOST_SHADOW_STAT}" == "${curr_shadow_stat}" ]] && [[ "${HOST_PASSWD_STAT}" == "${curr_passwd_stat}" ]] && [[ "${HOST_SUDOERS_STAT}" == "${curr_sudoers_stat}" ]]; then
+        echo -e "\033[1;32m[✓] BẢO VỆ TOÀN VẸN 100%: Hệ thống file Host (/etc/shadow, /etc/passwd, /etc/sudoers) không hề bị thay đổi!\033[0m"
     else
         echo -e "\033[1;31m[X] CẢNH BÁO NGUY HIỂM: Phát hiện biến đổi trên máy Host!\033[0m"
     fi
 
     # Kiểm tra tồn dư container
     local lingering=0
-    if command -v docker >/dev/null 2>&1; then
+    if [[ "${RUNTIME:-}" == "docker" ]]; then
         lingering=$(docker ps -a -q -f name="${CONTAINER_NAME}" 2>/dev/null | wc -l || echo 0)
-    elif command -v podman >/dev/null 2>&1; then
+    elif [[ "${RUNTIME:-}" == "podman" ]]; then
         lingering=$(podman ps -a -q -f name="${CONTAINER_NAME}" 2>/dev/null | wc -l || echo 0)
     fi
 

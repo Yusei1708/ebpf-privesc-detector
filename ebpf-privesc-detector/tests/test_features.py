@@ -8,7 +8,13 @@ import unittest
 import numpy as np
 
 from agent.collector import CEvent
-from agent.features import FeatureExtractor, FEATURE_NAMES, WHITELISTED_SUID_BINS
+from agent.features import (
+    FeatureExtractor,
+    FEATURE_NAMES,
+    WHITELISTED_SUID_BINS,
+    SERVICE_PARENT_NAMES,
+    CAP_SETUID,
+)
 
 
 class TestFeatureExtractor(unittest.TestCase):
@@ -103,10 +109,158 @@ class TestFeatureExtractor(unittest.TestCase):
     def test_cap_check_count(self):
         """Đếm số lần kiểm tra capability"""
         tgid = 600
-        for cap in [10, 21, 1]:
+        for cap in [CAP_SETUID, 21, 1]:
             self.extractor.add_event({"event_type": 3, "tgid": tgid, "cap": cap})
         _, f = self.extractor.extract_features(tgid)
         self.assertEqual(f["cap_check_count"], 3)
+
+    def test_spoofed_whitelisted_bin_in_tmp_rejected(self):
+        """Không cho phép giả mạo nhị phân whitelist trong /tmp hoặc path traversal vượt quyền kiểm tra"""
+        ev_tmp_sudo = {
+            "event_type": 1,
+            "tgid": 610,
+            "comm": "sudo",
+            "filename": "/tmp/sudo",
+            "timestamp": 100.0,
+        }
+        self.extractor.add_event(ev_tmp_sudo)
+        _, f1 = self.extractor.extract_features(610, ev_tmp_sudo)
+        self.assertEqual(f1["is_whitelisted_bin"], 0)
+        self.assertEqual(f1["suspicious_path_flag"], 1)
+
+        ev_traversal = {
+            "event_type": 1,
+            "tgid": 611,
+            "comm": "sudo",
+            "filename": "/usr/bin/../../tmp/sudo",
+            "timestamp": 100.0,
+        }
+        self.extractor.add_event(ev_traversal)
+        _, f2 = self.extractor.extract_features(611, ev_traversal)
+        self.assertEqual(f2["is_whitelisted_bin"], 0)
+        self.assertEqual(f2["suspicious_path_flag"], 1)
+
+    def test_legitimate_sudo_opening_sudoers_remains_whitelisted(self):
+        """sudo hợp lệ mở /etc/sudoers kể cả sau >3s vẫn phải giữ is_whitelisted_bin == 1"""
+        tgid = 620
+        self.extractor.add_event({
+            "event_type": 1,
+            "tgid": tgid,
+            "ppid": 10,
+            "uid": 1000,
+            "euid": 0,
+            "comm": "sudo",
+            "filename": "/usr/bin/sudo",
+            "timestamp": 10.0,
+        })
+        ev_open = {
+            "event_type": 4,
+            "tgid": tgid,
+            "ppid": 10,
+            "uid": 1000,
+            "euid": 0,
+            "comm": "sudo",
+            "filename": "/etc/sudoers",
+            "timestamp": 14.5,
+        }
+        self.extractor.add_event(ev_open)
+        _, feat = self.extractor.extract_features(tgid, ev_open)
+        self.assertEqual(feat["is_whitelisted_bin"], 1)
+        self.assertEqual(feat["suspicious_path_flag"], 0)
+        self.assertEqual(feat["sensitive_file_access"], 1)
+
+    def test_suspicious_exec_path_persists_after_window_slides(self):
+        """Tiến trình khởi chạy từ /tmp ngủ >3s rồi mở /etc/shadow vẫn bị gắn suspicious_path_flag == 1"""
+        tgid = 630
+        self.extractor.add_event({
+            "event_type": 1,
+            "tgid": tgid,
+            "uid": 1000,
+            "euid": 0,
+            "comm": "exploit",
+            "filename": "/tmp/payload.elf",
+            "timestamp": 10.0,
+        })
+        ev_later = {
+            "event_type": 4,
+            "tgid": tgid,
+            "uid": 1000,
+            "euid": 0,
+            "comm": "exploit",
+            "filename": "/etc/shadow",
+            "timestamp": 15.0,
+        }
+        self.extractor.add_event(ev_later)
+        _, feat = self.extractor.extract_features(tgid, ev_later)
+        self.assertEqual(feat["suspicious_path_flag"], 1)
+        self.assertEqual(feat["is_whitelisted_bin"], 0)
+
+    def test_interactive_shell_and_container_runtime_not_service_parents(self):
+        """sh/bash/dockerd/containerd không kích hoạt nhầm service_parent_flag, nhưng nginx -> bash -> sh vẫn bắt được"""
+        for non_svc in ("sh", "bash", "dockerd", "containerd"):
+            self.assertNotIn(non_svc, SERVICE_PARENT_NAMES)
+
+        # Bash người dùng bình thường -> không phải service parent
+        self.extractor.update_process(pid=640, ppid=1, comm="bash", uid=1000, euid=1000, cgroup_id=0, event_time=10.0)
+        self.extractor.update_process(pid=641, ppid=640, comm="sh", uid=1000, euid=1000, cgroup_id=0, event_time=10.5)
+        _, f_user = self.extractor.extract_features(641, {"event_type": 1, "tgid": 641, "comm": "sh", "filename": "/bin/sh", "timestamp": 10.5})
+        self.assertEqual(f_user["service_parent_flag"], 0)
+
+        # Web daemon nginx -> bash -> sh -> truy vết đa tầng vẫn bắt được service_parent_flag == 1
+        self.extractor.update_process(pid=650, ppid=1, comm="nginx", uid=33, euid=33, cgroup_id=0, event_time=10.0)
+        self.extractor.update_process(pid=651, ppid=650, comm="bash", uid=33, euid=33, cgroup_id=0, event_time=10.2)
+        self.extractor.update_process(pid=652, ppid=651, comm="sh", uid=33, euid=0, cgroup_id=0, event_time=10.4)
+        _, f_web = self.extractor.extract_features(652, {"event_type": 1, "tgid": 652, "comm": "sh", "filename": "/bin/sh", "timestamp": 10.4})
+        self.assertEqual(f_web["service_parent_flag"], 1)
+
+    def test_process_exit_pid_reuse_preserves_child_lineage(self):
+        """EVENT_PROCESS_EXIT giữ node cho con truy vết tổ tiên, đồng thời reset ngay trạng thái nếu PID bị tái sử dụng sớm"""
+        parent_pid = 710
+        child_pid = 711
+        self.extractor.add_event({
+            "event_type": 1,
+            "tgid": parent_pid,
+            "ppid": 1,
+            "uid": 33,
+            "euid": 33,
+            "comm": "nginx",
+            "filename": "/usr/sbin/nginx",
+            "timestamp": 100.0,
+        })
+        self.extractor.add_event({
+            "event_type": 1,
+            "tgid": child_pid,
+            "ppid": parent_pid,
+            "uid": 33,
+            "euid": 0,
+            "comm": "sh",
+            "filename": "/bin/sh",
+            "timestamp": 100.5,
+        })
+
+        # Tiến trình cha kết thúc sớm tại t=101.0
+        self.extractor.add_event({"event_type": 5, "tgid": parent_pid, "comm": "nginx", "timestamp": 101.0})
+        self.assertTrue(self.extractor.process_tree[parent_pid].exited)
+        self.assertNotIn(parent_pid, self.extractor.event_windows)
+
+        # Tiến trình con vẫn truy vết được cha nginx
+        _, f_child = self.extractor.extract_features(child_pid)
+        self.assertEqual(f_child["service_parent_flag"], 1)
+
+        # PID 710 bị hệ điều hành tái sử dụng chỉ sau 4 giây (t=105.0 << 300s) -> phải reset sạch ngay!
+        self.extractor.add_event({
+            "event_type": 1,
+            "tgid": parent_pid,
+            "ppid": 1,
+            "uid": 0,
+            "euid": 0,
+            "comm": "cron",
+            "filename": "/usr/sbin/cron",
+            "timestamp": 105.0,
+        })
+        self.assertFalse(self.extractor.process_tree[parent_pid].exited)
+        self.assertEqual(self.extractor.initial_uids[parent_pid], 0)
+        self.assertEqual(self.extractor.process_tree[parent_pid].exe_path, "/usr/sbin/cron")
 
     def test_reparenting_vs_pid_reuse(self):
         """Phân biệt an toàn giữa reparenting/nghỉ ngắn hạn và tái sử dụng PID sau idle dài hạn (> 300s)"""

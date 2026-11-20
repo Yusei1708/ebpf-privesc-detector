@@ -7,8 +7,9 @@ import json
 import stat
 import tempfile
 import unittest
+import numpy as np
 
-from agent.alert_logger import AlertLogger, sanitize_string
+from agent.alert_logger import AlertLogger, sanitize_string, is_container_event
 from agent.detector import RuleMatch
 
 
@@ -113,6 +114,42 @@ class TestAlertLogger(unittest.TestCase):
         with open(self.log_path, "r", encoding="utf-8") as f:
             record = json.loads(f.readline())
         self.assertFalse(record["is_container"])
+
+    def test_container_detected_via_pidns_id(self):
+        """Phân biệt Container vs Host dựa theo PID Namespace inode (pidns_id từ eBPF probes.c)"""
+        host_pidns = self.logger.host_pidns_id or 4026531836
+        self.assertFalse(is_container_event({"pidns_id": host_pidns}, host_pidns_id=host_pidns))
+        self.assertTrue(is_container_event({"pidns_id": host_pidns + 400}, host_pidns_id=host_pidns))
+
+    def test_log_alert_handles_none_and_numpy_types(self):
+        """Ghi log an toàn khi event có trường None, thiếu rule_name, hoặc feature kiểu NumPy float"""
+        alert_data = {
+            "event": {
+                "event_type": 1,
+                "pid": None,
+                "tgid": None,
+                "ppid": None,
+                "uid": 1000,
+                "euid": 0,
+                "comm": None,
+                "filename": None,
+            },
+            "raw_features": {
+                "exec_count": np.int64(3),
+                "priv_syscall_rate": np.float32(3.5),
+            },
+            "rule_name": None,
+            "rf_prob": 0.85,
+            "iso_score": -0.25,
+            "threat_score": 88,
+        }
+        self.assertTrue(self.logger.log_alert(alert_data))
+        with open(self.log_path, "r", encoding="utf-8") as f:
+            record = json.loads(f.readline())
+        self.assertIsNone(record["triggered_rule"])
+        self.assertEqual(record["matched_rules"], [])
+        self.assertEqual(record["features"]["exec_count"], 3)
+        self.assertAlmostEqual(record["features"]["priv_syscall_rate"], 3.5, places=2)
 
     def test_sanitize_string(self):
         """Khử bỏ null bytes và ký tự điều khiển lạ để tránh Log Injection"""

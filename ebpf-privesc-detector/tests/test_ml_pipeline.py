@@ -6,9 +6,12 @@ import os
 import json
 import tempfile
 import unittest
+from pathlib import Path
 import numpy as np
 
 from agent.features import FEATURE_NAMES
+from agent.detector import run_replay
+from benchmarks.benchmark_agent_vs_auditd import parse_proc_stat_jiffies
 from ml.telemetry_loader import TelemetryLoader, TelemetryValidationError
 
 
@@ -177,6 +180,89 @@ class TestMLPipeline(unittest.TestCase):
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    def test_validation_rejects_boolean_as_int_and_preserves_input(self):
+        """Từ chối kiểu bool dùng nhầm cho trường số nguyên và không làm biến đổi dict đầu vào"""
+        original = {
+            "timestamp_iso": "2026-10-23T12:00:00Z",
+            "event_type": "1",
+            "tgid": 2000,
+            "pid": 2000,
+            "uid": "1000",
+            "euid": 1000,
+            "comm": "ls",
+            "session_id": "sess_01",
+            "label": 0,
+        }
+        validated = self.loader.validate_record(original, 1)
+        self.assertEqual(validated["event_type"], 1)
+        self.assertEqual(validated["uid"], 1000)
+        # Dict gốc không bị ép kiểu
+        self.assertIsInstance(original["event_type"], str)
+        self.assertIsInstance(original["uid"], str)
+
+        bad_bool = dict(original)
+        bad_bool["label"] = True
+        with self.assertRaises(TelemetryValidationError) as ctx:
+            self.loader.validate_record(bad_bool, 1)
+        self.assertEqual(ctx.exception.field, "label")
+
+    def test_cross_session_pid_isolation_no_leakage(self):
+        """Hai phiên khác nhau trùng TGID (pid=1001) không được rò rỉ cửa sổ trượt hay exe_path"""
+        events = [
+            {
+                "timestamp": 100.0,
+                "event_type": 1,
+                "tgid": 1001,
+                "pid": 1001,
+                "ppid": 1,
+                "uid": 1000,
+                "euid": 0,
+                "comm": "sudo",
+                "filename": "/usr/bin/sudo",
+                "session_id": "sess_a",
+                "label": 0,
+            },
+            {
+                "timestamp": 100.5,
+                "event_type": 1,
+                "tgid": 1001,
+                "pid": 1001,
+                "ppid": 1,
+                "uid": 1000,
+                "euid": 0,
+                "comm": "find",
+                "filename": "/usr/bin/find",
+                "session_id": "sess_b",
+                "label": 1,
+            },
+        ]
+        df = self.loader.convert_events_to_features(events)
+        self.assertEqual(len(df), 2)
+        self.assertEqual(df.iloc[0]["exec_count"], 1)
+        self.assertEqual(df.iloc[0]["is_whitelisted_bin"], 1)
+        # Session B có TGID=1001 riêng biệt -> exec_count == 1 (không cộng dồn thành 2) và không lây whitelist sudo
+        self.assertEqual(df.iloc[1]["exec_count"], 1)
+        self.assertEqual(df.iloc[1]["is_whitelisted_bin"], 0)
+
+    def test_sample_telemetry_and_offline_replay(self):
+        """Kiểm chứng bộ sample_telemetry.jsonl hợp lệ và luồng --replay đạt Precision/Recall chuẩn xác"""
+        sample_path = Path(__file__).resolve().parent.parent / "ml" / "data" / "sample_telemetry.jsonl"
+        self.assertTrue(sample_path.exists())
+
+        records = self.loader.load_jsonl(str(sample_path))
+        self.assertEqual(len(records), 24)
+
+        summary = run_replay(str(sample_path), alert_log_path=None, quiet=True)
+        self.assertEqual(summary["sessions"], 6)
+        self.assertEqual(summary["fp"], 0)
+        self.assertEqual(summary["fn"], 0)
+        self.assertEqual(summary["tp"], 9)
+
+    def test_benchmark_proc_stat_parser_with_spaces_and_parens(self):
+        """Parser /proc/<pid>/stat không bị lệch cột khi tên tiến trình chứa khoảng trắng và ngoặc đơn"""
+        fake_stat = "4321 (Isolated Web (1)) R 1000 4321 1000 0 -1 4194304 100 0 0 0 150 25 0 0 20 0 1 0 12345"
+        self.assertEqual(parse_proc_stat_jiffies(fake_stat), 175)
 
 
 if __name__ == "__main__":
