@@ -15,8 +15,8 @@
   ],
   "anyOf": [
     { "required": ["timestamp_ns"] },
-    { "required": ["timestamp_iso"] },
-    { "required": ["timestamp"] }
+    { "required": ["timestamp"] },
+    { "required": ["timestamp_iso"] }
   ],
   "properties": {
     "timestamp_iso": {
@@ -36,8 +36,8 @@
     },
     "event_type": {
       "type": "integer",
-      "enum": [1, 2, 3, 4, 5],
-      "description": "1: sys_enter_execve/execveat, 2: commit_creds, 3: cap_capable, 4: sys_enter_openat, 5: sched_process_exit"
+      "enum": [1, 2, 3, 4, 5, 6],
+      "description": "1: sys_enter/exit_execve/execveat, 2: commit_creds, 3: cap_capable, 4: sys_enter_openat, 5: sched_process_exit, 6: sched_process_fork"
     },
     "tgid": {
       "type": "integer",
@@ -67,7 +67,12 @@
     "cap": {
       "type": "integer",
       "minimum": 0,
-      "description": "Mã capability khi event_type=3 (ví dụ 7: CAP_SETUID, 21: CAP_SYS_ADMIN)"
+      "description": "Mã capability khi event_type=3 (ví dụ 1: CAP_DAC_OVERRIDE, 7: CAP_SETUID, 16: CAP_SYS_MODULE, 21: CAP_SYS_ADMIN)"
+    },
+    "flags": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Bitmask cờ kernel (0x01: FLAG_OPEN_WRITE, 0x02: FLAG_CRED_UID_GAIN, 0x04: FLAG_CRED_CAP_GAIN, 0x10: FLAG_CAP_USERNS, 0x20: FLAG_EXEC_FAILED)"
     },
     "cgroup_id": {
       "type": "integer",
@@ -82,10 +87,11 @@
     "mntns_id": {
       "type": "integer",
       "minimum": 0,
-      "description": "Inode number của Mount Namespace (tương thích telemetry cũ)"
+      "description": "Inode number của Mount Namespace (tương thích telemetry cũ và container --pid=host)"
     },
     "comm": {
       "type": "string",
+      "minLength": 1,
       "maxLength": 16,
       "description": "Tên ngắn gọn của tiến trình (task comm)"
     },
@@ -96,6 +102,7 @@
     },
     "session_id": {
       "type": "string",
+      "minLength": 1,
       "description": "Mã định danh phiên làm việc hoặc kịch bản kiểm thử (để phân tách train/test tránh data leakage)"
     },
     "label": {

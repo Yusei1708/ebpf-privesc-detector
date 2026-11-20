@@ -1,10 +1,13 @@
 {
   "disclaimer": "CHÚ Ý VỀ DỮ LIỆU ĐÁNH GIÁ: Các chỉ số dưới đây được đánh giá trên tập dữ liệu mô phỏng hoặc telemetry ban đầu dùng để thiết lập trọng số khởi động (cold-start). Hiệu năng phát hiện trong môi trường sản xuất thực tế phụ thuộc vào việc nạp và tinh chỉnh thêm với telemetry có nhãn từ hệ thống mục tiêu.",
-  "data_source": "Synthetic Baseline Simulation (Grouped Sessions)",
+  "data_source": "Synthetic Event-Stream Baseline Simulation (Grouped Sessions)",
   "split_method": "GroupShuffleSplit (grouped by session_id to prevent data leakage)",
-  "n_samples": 11652,
-  "n_train": 8739,
-  "n_test": 2913,
+  "n_samples": 3327,
+  "n_train": 2485,
+  "n_test": 842,
+  "n_sessions_total": 600,
+  "n_sessions_train": 450,
+  "n_sessions_test": 150,
   "features": [
     "exec_count",
     "uid_change_flag",
@@ -15,28 +18,56 @@
     "cap_check_count",
     "priv_syscall_rate"
   ],
+  "serving_thresholds": {
+    "rf_attack": 0.65,
+    "rf_iso_combo": 0.4,
+    "iso_severe_outlier": -0.18,
+    "iso_severe_rf_floor": 0.2
+  },
   "evaluation_metrics": {
-    "roc_auc": 0.9982,
-    "precision": 0.9854,
-    "recall": 0.9782,
-    "f1_score": 0.9818,
-    "false_positive_rate": 0.0028,
-    "false_negative_rate": 0.0218,
+    "roc_auc": 0.9989,
+    "precision": 0.9589,
+    "recall": 0.9589,
+    "f1_score": 0.9589,
+    "false_positive_rate": 0.0039,
+    "false_negative_rate": 0.0411,
     "confusion_matrix": {
-      "true_negative": 2493,
-      "false_positive": 7,
-      "false_negative": 9,
-      "true_positive": 404
+      "true_negative": 766,
+      "false_positive": 3,
+      "false_negative": 3,
+      "true_positive": 70
     }
   },
+  "combined_tier2_metrics": {
+    "precision": 0.9589,
+    "recall": 0.9589,
+    "f1_score": 0.9589,
+    "false_positive_rate": 0.0039,
+    "false_negative_rate": 0.0411,
+    "confusion_matrix": {
+      "true_negative": 766,
+      "false_positive": 3,
+      "false_negative": 3,
+      "true_positive": 70
+    }
+  },
+  "isolation_forest_metrics": {
+    "benign_fpr": 0.0377,
+    "attack_detection_rate": 0.4795
+  },
   "feature_importances": {
-    "is_whitelisted_bin": 0.3642,
-    "priv_syscall_rate": 0.2615,
-    "sensitive_file_access": 0.1420,
-    "uid_change_flag": 0.0985,
-    "cap_check_count": 0.0612,
-    "suspicious_path_flag": 0.0421,
-    "exec_count": 0.0215,
-    "service_parent_flag": 0.0090
+    "exec_count": 0.0468,
+    "uid_change_flag": 0.273,
+    "is_whitelisted_bin": 0.1067,
+    "suspicious_path_flag": 0.165,
+    "service_parent_flag": 0.0251,
+    "sensitive_file_access": 0.0493,
+    "cap_check_count": 0.1147,
+    "priv_syscall_rate": 0.2195
+  },
+  "model_checksums": {
+    "scaler.joblib": "5b053c9eb42b771d38d0a354302ead26c061fcaf5a1550d421da525645d63d47",
+    "random_forest.joblib": "66f83763792f3f0353e5488d7c81a7e24a223585144e122a84aabc84e09e5d30",
+    "isolation_forest.joblib": "bed51cb9ab166b3723f3dc9f9d3831773cf9c0e81e7b621b0c6934008fbacbb6"
   }
 }
